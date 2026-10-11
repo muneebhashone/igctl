@@ -433,6 +433,24 @@ Secrets are never written to `config.yaml`. They are stored in the OS keyring un
 
 ---
 
+## Use it from AI agents
+
+The repo includes an [Agent Skill](https://agentskills.io) at `skills/igctl/`. Any agent that supports skills can use it. Copy or symlink the folder into your agent's skills directory, for example:
+
+```bash
+uv tool install .                              # puts `igctl` on PATH for the agent
+cp -r skills/igctl ~/.claude/skills/igctl      # Claude Code (user-level)
+cp -r skills/igctl .claude/skills/igctl        # or project-level
+```
+
+The skill tells the agent how to call the CLI (`--json`, `--dry-run`, `-a`). It also makes the agent ask for approval before anything other people can see, keep bulk actions small, and never handle your password. `AGENTS.md` covers agents that work *on* this codebase.
+
+The files under `skills/igctl/references/` are generated from the CLI. Regenerate them after changing commands:
+
+```bash
+uv run python scripts/gen_skill_reference.py
+```
+
 ## Development
 
 ```bash
