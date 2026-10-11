@@ -105,6 +105,10 @@ def warn(msg: str) -> None:
     err_console.print(f"[yellow]![/yellow] {escape(msg)}")
 
 
+def info(msg: str) -> None:
+    err_console.print(f"[cyan]…[/cyan] {escape(msg)}")
+
+
 def confirm_or_abort(ctx: Context, prompt: str, yes: bool) -> None:
     """Ask for confirmation on stderr (stdout carries --json output) unless ``--yes``."""
     if yes or ctx.dry_run:

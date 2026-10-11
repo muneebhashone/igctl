@@ -519,3 +519,98 @@ def test_client_configured(client):
     client.set_proxy.assert_called_once_with("http://p:1")
     assert b.client.delay_range == [1, 3]
     assert callable(b.client.challenge_code_handler)
+
+
+# ------------------------------------------------------- timeouts (ideas from aiograpi)
+def test_apply_timeouts_sets_defaults_and_keeps_explicit(monkeypatch):
+    from instagrapi import Client
+
+    from igctl.backends.private import apply_timeouts
+
+    client = Client()
+    seen: list[object] = []
+    monkeypatch.setattr(
+        requests.Session, "request", lambda self, m, u, *a, **kw: seen.append(kw["timeout"])
+    )
+    for attr in ("private", "public", "graphql"):
+        session = getattr(client, attr)
+        session.request = requests.Session.request.__get__(session)
+    apply_timeouts(client, 5, 20, 200)
+    apply_timeouts(client, 1, 1, 1)  # idempotent: a second call must not re-wrap
+
+    client.private.get("https://i.instagram.com/api/v1/feed/timeline/")
+    client.private.post("https://i.instagram.com/rupload_igvideo/abc")
+    client.public.get("https://www.instagram.com/x/", timeout=3)
+    client.graphql.get("https://www.instagram.com/graphql/query/")
+    assert seen == [(5, 20), (5, 200), 3, (5, 20)]
+
+
+def test_stalled_server_times_out_instead_of_hanging():
+    """A server that accepts the connection but never answers must not hang the CLI."""
+    import socket
+    import threading
+    import time
+
+    from instagrapi import Client
+
+    from igctl.backends.private import apply_timeouts
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    accepted: list[socket.socket] = []
+    threading.Thread(target=lambda: accepted.append(server.accept()[0]), daemon=True).start()
+
+    client = Client()
+    apply_timeouts(client, 1, 0.5, 0.5)
+    start = time.monotonic()
+    try:
+        with pytest.raises(requests.Timeout) as info:
+            client.private.get(f"http://127.0.0.1:{port}/")
+    finally:
+        server.close()
+        for s in accepted:
+            s.close()
+    assert time.monotonic() - start < 5
+    assert isinstance(map_error(info.value), TransientError)
+
+
+@pytest.mark.parametrize(
+    ("exc", "needle"),
+    [
+        (ig.ClientError("checkpoint_required"), "checkpoint"),
+        (ig.ClientBadRequestError("consent_required"), "confirm"),
+        (ig.ClientError("x", challenge={"url": "https://i.instagram.com/terms/accept/"}), "Terms"),
+        (
+            ig.ClientError("x", challenge={"url": "https://www.instagram.com/terms/unblock/"}),
+            "warning",
+        ),
+        (ig.ClientError("blocked", error_type="geoblock_required"), "region"),
+    ],
+)
+def test_checkpoints_get_actionable_auth_errors(exc, needle):
+    err = map_error(exc)
+    assert isinstance(err, AuthError)
+    assert needle in str(err)
+
+
+def test_unrelated_client_error_is_not_a_checkpoint():
+    from igctl.backends.private import checkpoint_hint
+
+    assert checkpoint_hint(ig.ClientError("media not found")) is None
+
+
+def test_proxy_and_timeout_errors_are_transient_with_hints():
+    proxy = map_error(requests.exceptions.ProxyError("Cannot connect to proxy"))
+    assert isinstance(proxy, TransientError) and "proxy" in str(proxy)
+    wrapped = map_error(ig.ClientConnectionError("ProxyError Cannot connect to proxy"))
+    assert isinstance(wrapped, TransientError) and "proxy" in str(wrapped)
+    slow = map_error(requests.ReadTimeout("read timed out"))
+    assert isinstance(slow, TransientError) and "read_timeout" in str(slow)
+
+
+def test_backend_applies_account_timeouts():
+    acct = Account(name="t", backend="private", read_timeout=12, upload_timeout=99)
+    be = PrivateBackend(acct)
+    assert getattr(be.client.private, "_igctl_timeouts", False)

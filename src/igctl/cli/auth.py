@@ -8,7 +8,7 @@ import httpx
 import typer
 
 from igctl.backends.base import AuthError, IgctlError
-from igctl.cli._common import emit, emit_ok, get_ctx, ok, warn
+from igctl.cli._common import emit, emit_ok, get_ctx, info, ok, warn
 from igctl.core.config import Account, Config, delete_secret, get_secret, sessions_dir, set_secret
 from igctl.core.context import make_backend
 
@@ -80,7 +80,9 @@ def login(
         acct.ig_user_id = acct.ig_user_id or profile.id
     else:
         username = username or typer.prompt("Instagram username")
-        password = password or typer.prompt("Password", hide_input=True)
+        password = password or typer.prompt(
+            "Password (hidden as you type or paste; press Enter)", hide_input=True
+        )
         acct.username = username
         if proxy is not None:
             acct.proxy = proxy or None
@@ -88,6 +90,12 @@ def login(
         login_fn = getattr(be, "login", None)
         if login_fn is None:
             raise IgctlError("The private backend does not implement login().")
+        # Login is silent for 10-60 s (instagrapi paces its requests) and may wait on a
+        # "Was this you?" check, so say what's happening instead of looking frozen.
+        info(
+            f"Logging in as @{username}... this can take up to a minute. If Instagram asks "
+            "'Was this you?', approve it in the Instagram app."
+        )
         try:
             login_fn(username, password, verification_code=two_factor)
         except IgctlError:

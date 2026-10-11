@@ -69,6 +69,11 @@ class Account(BaseModel):
     graph_host: str = "graph.facebook.com"  # or graph.instagram.com for IG Login tokens
     # Private API
     proxy: str | None = None
+    # Network timeouts (seconds) for private-API requests; instagrapi sets none by itself,
+    # so a stalled connection would otherwise hang forever. Uploads get the longer limit.
+    connect_timeout: float = 10.0
+    read_timeout: float = 30.0
+    upload_timeout: float = 300.0
     limits: Limits = Field(default_factory=Limits)
 
 

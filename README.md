@@ -420,7 +420,12 @@ accounts:
     backend: private
     username: myalt
     proxy: http://user:pass@host:port
+    connect_timeout: 10    # seconds; private-API network timeouts (instagrapi sets none itself)
+    read_timeout: 30
+    upload_timeout: 300    # media uploads (Instagram may process before it answers)
 ```
+
+Private-API requests always have a timeout, so a dead connection or proxy fails with a clear error instead of hanging. Scheduled posts retry it like other network errors. Account checkpoints (security check, consent, updated Terms, a warning to acknowledge, suspension) come with a message telling you what to do in the Instagram app.
 
 Secrets are never written to `config.yaml`. They are stored in the OS keyring under service `igctl`, with keys `<alias>:token` and `<alias>:password`.
 

@@ -64,6 +64,12 @@ _SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,}$")
 
 
 # --------------------------------------------------------------------------- errors
+PROXY_HINT = (
+    "Could not connect through the proxy ({detail}). Fix the account's proxy with "
+    "`igctl auth login NAME --backend private --proxy URL` (`--proxy ''` removes it)."
+)
+
+
 def map_error(exc: Exception) -> IgctlError:
     """Translate an instagrapi exception into an igctl error with an actionable message."""
     if isinstance(exc, IgctlError):
@@ -97,6 +103,17 @@ def map_error(exc: Exception) -> IgctlError:
             return RateLimited(f"Instagram is rate limiting requests ({detail}); retry later.")
         case ig.ProxyAddressIsBlocked():
             return IgctlError("Instagram blocked the proxy IP; configure a different proxy.")
+        case requests.exceptions.ProxyError() | httpx.ProxyError():
+            return TransientError(PROXY_HINT.format(detail=detail))
+        case ig.ClientConnectionError() if "ProxyError" in detail:
+            return TransientError(PROXY_HINT.format(detail=detail))
+        case requests.Timeout() | httpx.TimeoutException() | ig.ClientRequestTimeout():
+            return TransientError(
+                f"Instagram did not respond in time ({detail}). Check your connection or proxy, "
+                "or raise read_timeout/upload_timeout for this account in config.yaml."
+            )
+        case ig.ClientError() if hint := checkpoint_hint(exc):
+            return AuthError(hint)
         case ig.PrivateAccount():
             return IgctlError(f"That account is private: {detail}")
         case ig.NotFoundError() | ig.ClientNotFoundError():
@@ -124,6 +141,84 @@ def map_error(exc: Exception) -> IgctlError:
             )
         case _:
             return IgctlError(f"Instagram error ({type(exc).__name__}): {detail}")
+
+
+# Account checkpoints instagrapi reports only as a generic ClientError/ChallengeRequired.
+# Classified the way aiograpi does: by the API "message"/"error_type" and redirect URL.
+_CHECKPOINT_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "/suspended/",
+        "Instagram suspended or disabled this account. Open the Instagram app to see the "
+        "notice and appeal there; igctl can't continue.",
+    ),
+    (
+        "/terms/unblock",
+        "Instagram wants you to acknowledge a warning before the account can be used again. "
+        "Open the Instagram app, follow the prompt, then run `igctl auth login` again.",
+    ),
+    (
+        "/terms/accept",
+        "Instagram wants you to accept updated Terms. Open the Instagram app, accept them, "
+        "then run `igctl auth login` again.",
+    ),
+    (
+        "consent_required",
+        "Instagram needs you to confirm something (e.g. your birthday or data consent). Open "
+        "the Instagram app, complete the prompt, then run `igctl auth login` again.",
+    ),
+    (
+        "checkpoint_required",
+        "Instagram put the account at a security checkpoint. Open the Instagram app (or "
+        "instagram.com) and confirm it was you, then run `igctl auth login` again.",
+    ),
+    (
+        "geoblock",
+        "Instagram is blocking this account in the current region or IP. Try without a proxy "
+        "or from your usual network.",
+    ),
+)
+
+
+def checkpoint_hint(exc: Exception) -> str | None:
+    """An actionable message when ``exc`` is an account checkpoint, else ``None``."""
+    challenge = getattr(exc, "challenge", None)
+    fields = [
+        getattr(exc, "message", ""),
+        getattr(exc, "error_type", ""),
+        getattr(exc, "checkpoint_url", ""),
+        challenge.get("url", "") if isinstance(challenge, dict) else "",
+    ]
+    response = getattr(exc, "response", None)
+    fields.append(str(getattr(response, "url", "") or ""))
+    haystack = " ".join(str(f) for f in fields if f).lower()
+    for needle, hint in _CHECKPOINT_HINTS:
+        if needle in haystack:
+            return hint
+    return None
+
+
+def apply_timeouts(client: Client, connect: float, read: float, upload: float) -> None:
+    """Give every instagrapi HTTP session a default timeout.
+
+    instagrapi passes no ``timeout`` on private API calls, so a stalled connection hangs
+    forever (aiograpi uses 25 s). Requests that set their own timeout keep it. Uploads
+    (``/rupload_``) get ``upload`` as the read timeout, since Instagram may take a while to
+    process media before it answers.
+    """
+    for attr in ("private", "public", "graphql"):
+        session = getattr(client, attr, None)
+        if not isinstance(session, requests.Session) or getattr(session, "_igctl_timeouts", False):
+            continue
+        original = session.request
+
+        def request(method, url, *args, _orig=original, **kwargs):  # type: ignore[no-untyped-def]
+            if kwargs.get("timeout") is None:
+                slow = "/rupload_" in str(url)
+                kwargs["timeout"] = (connect, upload if slow else read)
+            return _orig(method, url, *args, **kwargs)
+
+        session.request = request  # type: ignore[method-assign]
+        session._igctl_timeouts = True  # type: ignore[attr-defined]
 
 
 # instagrapi also raises bare AssertionErrors ("Login required"; its own ValidationError
@@ -449,6 +544,9 @@ class PrivateBackend(Backend):
             client.set_proxy(account.proxy)
         if not client.delay_range:
             client.delay_range = list(DEFAULT_DELAY_RANGE)
+        apply_timeouts(
+            client, account.connect_timeout, account.read_timeout, account.upload_timeout
+        )
         client.challenge_code_handler = prompt_challenge_code
         client.change_password_handler = _refuse_password_change
         self.client = client
