@@ -1,0 +1,134 @@
+# igctl automation rules
+#
+#   igctl automate validate examples/rules.yaml      # check the file
+#   igctl --dry-run automate run examples/rules.yaml --force   # preview, change nothing
+#   igctl automate run examples/rules.yaml            # run whatever is due, once
+#   igctl automate run examples/rules.yaml --loop     # keep running (e.g. under a service)
+#   igctl automate list-triggers                      # every trigger and its options
+#
+# Rule fields:
+#   name      unique id (last-run time is tracked per rule)
+#   account   account alias (default: --account / default_account)
+#   backend   graph | private (default: the trigger's preference, then the account's)
+#   enabled   false to keep a rule without running it
+#   every     interval ("30s", "15m", "2h", "1h30m", "1d") or a cron expression ("0 9 * * *", UTC)
+#   trigger   {type: <trigger>, ...trigger options}
+#   filter    {keywords: [...], regex: "...", match: any|all, exclude: [...]}  (case-insensitive)
+#   action    the trigger's action options (templates use {placeholders}, see below)
+#   limits    {max_per_run: N, min_delay: s, max_delay: s}
+#
+# Every write goes through the account's safety guard: random human-like delays and rolling
+# 24h caps per action (like/comment/follow/unfollow/dm) set in config.yaml `limits`.
+# Automating likes/follows/DMs uses the private API and can get an account restricted.
+# Start with small numbers.
+
+defaults:            # merged into every rule (a rule's own keys win)
+  enabled: true
+  limits:
+    min_delay: 20
+    max_delay: 60
+
+rules:
+  # Reply to comments asking about price on my 5 most recent posts, and hide spam.
+  # Works with the Graph API. Placeholders: {username} {text} {permalink}
+  - name: price-replies
+    every: 15m
+    trigger:
+      type: comment_autoreply
+      posts: 5
+      max_age_hours: 48
+    filter:
+      keywords: [price, cost, "how much"]
+      match: any
+    action:
+      reply: "Hi @{username}! We've sent you the details by DM."
+      hide_blocklist: ["free followers", "dm me for promo", "check my bio"]
+    limits:
+      max_per_run: 20
+
+  # Auto-reply to unread DMs that mention "collab". Placeholders: {username} {text}
+  - name: collab-dms
+    every: 30m
+    trigger:
+      type: dm_autoreply
+      threads: 30
+      unread_only: true
+      once_per_thread: true
+    filter:
+      keywords: [collab, collaboration, partnership]
+    action:
+      reply: "Thanks {username}! Please email partnerships@example.com and we'll get back to you."
+      mark_seen: true
+
+  # Welcome new followers by DM. The first run only records a baseline.
+  # Placeholders: {username} {full_name}
+  - name: welcome-new-followers
+    every: 1h
+    trigger:
+      type: welcome_dm
+      scan_limit: 500
+    action:
+      message: "Hey {full_name}, thanks for the follow! Anything you'd like to see more of?"
+    limits:
+      max_per_run: 10
+
+  # Like (and sometimes comment on) recent posts in a few hashtags. Already-engaged and own
+  # posts are skipped. Placeholders: {username} {text} {tag}
+  - name: engage-hashtags
+    every: "0 9,13,18 * * *"
+    trigger:
+      type: hashtag_engage
+      tags: ["#streetphotography", "filmphotography"]
+      recent: true
+      per_tag: 30
+    filter:
+      exclude: [giveaway, "follow for follow", f4f]
+    action:
+      like: true
+      comments:
+        - "Great shot @{username}!"
+        - "Love the light in this one."
+        - "This is beautiful #{tag} work."
+      comment_probability: 0.2
+    limits:
+      max_per_run: 15
+
+  # Unfollow accounts that don't follow back, but only once they've had 7 days
+  # (measured from when igctl followed them).
+  - name: prune-nonfollowers
+    every: 1d
+    enabled: false
+    trigger:
+      type: unfollow_nonfollowers
+      whitelist: [instagram, natgeo, my_best_friend]
+      min_days_followed: 7
+      only_followed_by_igctl: true
+    limits:
+      max_per_run: 25
+
+  # Follow people who follow a similar account, skipping private ones.
+  - name: follow-similar-audience
+    every: 6h
+    enabled: false
+    trigger:
+      type: follow_from
+      user: some_similar_brand
+      audience: followers      # followers | following | likers | commenters
+      scan_limit: 200
+      skip_private: true
+      skip_verified: true
+    limits:
+      max_per_run: 10
+
+  # Follow commenters of one specific post (use `post:` with a media id instead of `user:`).
+  - name: follow-post-commenters
+    every: 12h
+    enabled: false
+    trigger:
+      type: follow_from
+      post: "3412345678901234567_123456789"
+      audience: commenters
+    filter:
+      exclude: [shop, promo]
+    limits:
+      max_per_run: 5
