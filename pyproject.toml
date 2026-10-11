@@ -13,14 +13,21 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "pyyaml>=6.0",
-    "instagrapi>=2.1",
+    "instagrapi>=3.0.21",
     "pillow>=10.0",
     "keyring>=25.0",
     "croniter>=2.0",
+    "tzdata>=2026.5 ; sys_platform == 'win32'",
+    "moviepy>=2.2",
 ]
 
 [project.scripts]
 igctl = "igctl.cli.main:run"
+
+[project.optional-dependencies]
+s3 = [
+    "boto3>=1.34",
+]
 
 [dependency-groups]
 dev = [
@@ -42,3 +49,7 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# moviepy pins pillow<12 out of caution; instagrapi 3 needs pillow 12 and moviepy works with it.
+override-dependencies = ["pillow>=12.2,<13"]

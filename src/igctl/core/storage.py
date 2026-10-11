@@ -109,7 +109,8 @@ class Store:
     def enqueue_post(self, account: str, request_json: str, run_at: datetime) -> int:
         with self.tx() as c:
             cur = c.execute(
-                "INSERT INTO scheduled_posts(account, request, run_at, created_at) VALUES (?,?,?,?)",
+                "INSERT INTO scheduled_posts(account, request, run_at, created_at) "
+                "VALUES (?,?,?,?)",
                 (account, request_json, iso(run_at), iso()),
             )
             return int(cur.lastrowid)
@@ -117,7 +118,8 @@ class Store:
     def due_posts(self, now: datetime | None = None) -> list[sqlite3.Row]:
         return list(
             self._conn.execute(
-                "SELECT * FROM scheduled_posts WHERE status='pending' AND run_at<=? ORDER BY run_at",
+                "SELECT * FROM scheduled_posts WHERE status='pending' AND run_at<=? "
+                "ORDER BY run_at",
                 (iso(now),),
             )
         )

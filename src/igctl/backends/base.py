@@ -92,8 +92,14 @@ class Backend(ABC):
     def search_users(self, query: str, limit: int = 20) -> list[UserSummary]:
         raise NotSupported(self.name, "search_users")
 
+    def media_likers(self, media_id: str, limit: int = 0) -> list[UserSummary]:
+        """Users who liked ``media_id``. ``limit=0`` means all the API returns."""
+        raise NotSupported(self.name, "media_likers")
+
     # --- insights ------------------------------------------------------------
-    def account_insights(self, metrics: list[str], period: str = "day", days: int = 30) -> list[Insight]:
+    def account_insights(
+        self, metrics: list[str], period: str = "day", days: int = 30
+    ) -> list[Insight]:
         raise NotSupported(self.name, "account_insights")
 
     def media_insights(self, media_id: str, metrics: list[str] | None = None) -> list[Insight]:
@@ -134,6 +140,13 @@ class Backend(ABC):
     def reply_dm(self, thread_id: str, text: str) -> DirectMessage:
         raise NotSupported(self.name, "reply_dm")
 
+    def mark_thread_seen(self, thread_id: str) -> None:
+        raise NotSupported(self.name, "mark_thread_seen")
+
     # --- downloads -----------------------------------------------------------
     def download_media(self, media_id: str, dest: str) -> list[str]:
         raise NotSupported(self.name, "download_media")
+
+    def download_stories(self, username: str | None, dest: str) -> list[str]:
+        """Download ``username``'s active stories into ``dest``; returns the file paths."""
+        raise NotSupported(self.name, "download_stories")

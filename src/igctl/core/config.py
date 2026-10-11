@@ -13,6 +13,7 @@ service ``igctl`` with key ``<account>:<kind>``; they are never written to confi
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -107,8 +108,13 @@ class Config(BaseModel):
         return self.accounts[name]
 
 
+def secret_env_var(account: str, kind: str) -> str:
+    """Environment variable that overrides the keyring, e.g. ``IGCTL_MY_BRAND_TOKEN``."""
+    return f"IGCTL_{re.sub(r'[^A-Z0-9]', '_', account.upper())}_{kind.upper()}"
+
+
 def get_secret(account: str, kind: str) -> str | None:
-    env = os.environ.get(f"IGCTL_{account.upper()}_{kind.upper()}")
+    env = os.environ.get(secret_env_var(account, kind))
     if env:
         return env
     return keyring.get_password(KEYRING_SERVICE, f"{account}:{kind}")
