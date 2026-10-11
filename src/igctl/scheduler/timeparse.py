@@ -42,6 +42,8 @@ def resolve_tz(name: str | None) -> tzinfo | None:
         return UTC
     if m := _OFFSET.match(name.strip()):
         sign, hours, minutes = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+        if hours > 23 or minutes > 59:
+            raise TimeParseError(f"Invalid UTC offset '{name}' (hours 0-23, minutes 0-59).")
         delta = timedelta(hours=hours, minutes=minutes)
         return timezone(-delta if sign == "-" else delta)
     try:

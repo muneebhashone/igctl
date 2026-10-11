@@ -42,6 +42,7 @@ def form(request: httpx.Request) -> dict[str, str]:
 def test_publish_image():
     g, _ = make()
     create = respx.post(f"{BASE}/{IG}/media").respond(json={"id": "c1"})
+    status = respx.get(f"{BASE}/c1").respond(json={"status_code": "FINISHED"})
     publish = respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m1"})
     respx.get(f"{BASE}/m1").respond(json={"permalink": "https://instagram.com/p/abc/"})
 
@@ -62,6 +63,7 @@ def test_publish_image():
     assert json.loads(body["user_tags"]) == [{"username": "friend", "x": 0.5, "y": 0.5}]
     assert create.calls.last.request.url.params["access_token"] == "tok"
     assert form(publish.calls.last.request) == {"creation_id": "c1"}
+    assert status.called  # image containers are status-checked before publishing
 
 
 @respx.mock
@@ -71,6 +73,7 @@ def test_publish_carousel():
     create = respx.post(f"{BASE}/{IG}/media").mock(
         side_effect=lambda req: httpx.Response(200, json={"id": next(ids)})
     )
+    k1 = respx.get(f"{BASE}/k1").respond(json={"status_code": "FINISHED"})
     respx.get(f"{BASE}/k2").respond(json={"status_code": "FINISHED"})
     respx.get(f"{BASE}/parent").respond(json={"status_code": "FINISHED"})
     respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m9"})
@@ -79,14 +82,15 @@ def test_publish_carousel():
     res = g.publish(
         PublishRequest(
             media_type=MediaType.CAROUSEL,
-            urls=["https://cdn.example/1.png", "https://cdn.example/2.mp4"],
+            urls=["https://cdn.example/1.jpg", "https://cdn.example/2.mp4"],
             caption="album",
         )
     )
 
     assert res.media_id == "m9"
+    assert k1.called  # image children are waited on too
     bodies = [form(c.request) for c in create.calls]
-    assert bodies[0] == {"is_carousel_item": "true", "image_url": "https://cdn.example/1.png"}
+    assert bodies[0] == {"is_carousel_item": "true", "image_url": "https://cdn.example/1.jpg"}
     assert bodies[1] == {
         "is_carousel_item": "true",
         "video_url": "https://cdn.example/2.mp4",
@@ -152,6 +156,7 @@ def test_reel_poll_timeout():
 def test_story_drops_caption():
     g, _ = make()
     create = respx.post(f"{BASE}/{IG}/media").respond(json={"id": "s1"})
+    respx.get(f"{BASE}/s1").respond(json={"status_code": "FINISHED"})
     respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m3"})
     respx.get(f"{BASE}/m3").respond(json={})
     g.publish(PublishRequest(media_type=MediaType.STORY, urls=["https://x/s.jpg"], caption="no"))
@@ -437,6 +442,176 @@ def test_delete_media_requires_facebook_host():
 
 
 # --- media_host ------------------------------------------------------------------
+
+
+# --- regressions -----------------------------------------------------------------
+
+
+def _echo_host(tmp_path: Path, template: str) -> tuple[Config, Path]:
+    """A cmd: media host that records each uploaded file and prints ``template``."""
+    log = tmp_path / "uploads.txt"
+    script = tmp_path / "up.py"
+    script.write_text(
+        "import sys, pathlib\n"
+        f"log = pathlib.Path({str(log)!r})\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "log.open('a').write(str(p) + '\\n')\n"
+        f"print({template!r}.format(name=p.name, stem=p.stem))\n"
+    )
+    return Config(media_host=f'cmd:"{sys.executable}" "{script}" {{path}}'), log
+
+
+def test_non_jpeg_url_is_rejected():
+    g, _ = make()
+    with pytest.raises(IgctlError, match="only accepts JPEG"):
+        g.publish(PublishRequest(media_type=MediaType.IMAGE, urls=["https://x/a.png"]))
+
+
+@respx.mock
+def test_local_png_is_converted_to_jpeg(tmp_path: Path):
+    from PIL import Image
+
+    png = tmp_path / "pic.png"
+    Image.new("RGBA", (100, 100), (255, 0, 0, 128)).save(png)
+    cfg, log = _echo_host(tmp_path, "https://h/{name}")
+    g = GraphBackend(
+        Account(name="brand", ig_user_id=IG), httpx.Client(), cfg, sleep=lambda s: None
+    )
+    create = respx.post(f"{BASE}/{IG}/media").respond(json={"id": "c1"})
+    respx.get(f"{BASE}/c1").respond(json={"status_code": "FINISHED"})
+    respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m1"})
+    respx.get(f"{BASE}/m1").respond(json={})
+
+    g.publish(PublishRequest(media_type=MediaType.IMAGE, paths=[png]))
+
+    uploaded = Path(log.read_text().splitlines()[0])
+    assert uploaded.suffix == ".jpg"
+    assert form(create.calls.last.request)["image_url"].endswith(".jpg")
+
+
+@respx.mock
+def test_carousel_video_detected_from_local_path(tmp_path: Path):
+    from PIL import Image
+
+    pic, clip = tmp_path / "a.jpg", tmp_path / "b.mp4"
+    Image.new("RGB", (100, 100)).save(pic)
+    clip.write_bytes(b"x")
+    cfg, _ = _echo_host(tmp_path, "https://h/{stem}")  # extension-less hosted URLs
+    g = GraphBackend(
+        Account(name="brand", ig_user_id=IG), httpx.Client(), cfg, sleep=lambda s: None
+    )
+    ids = iter(["k1", "k2", "parent"])
+    create = respx.post(f"{BASE}/{IG}/media").mock(
+        side_effect=lambda req: httpx.Response(200, json={"id": next(ids)})
+    )
+    for cid in ("k1", "k2", "parent"):
+        respx.get(f"{BASE}/{cid}").respond(json={"status_code": "FINISHED"})
+    respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m1"})
+    respx.get(f"{BASE}/m1").respond(json={})
+
+    g.publish(PublishRequest(media_type=MediaType.CAROUSEL, paths=[pic, clip]))
+
+    bodies = [form(c.request) for c in create.calls]
+    assert bodies[0]["image_url"] == "https://h/a"
+    assert bodies[1]["video_url"] == "https://h/b" and bodies[1]["media_type"] == "VIDEO"
+
+
+@respx.mock
+def test_carousel_extensionless_url_is_probed():
+    g, _ = make()
+    respx.head("https://cdn/v1").respond(headers={"content-type": "video/mp4"})
+    respx.head("https://cdn/i1").respond(headers={"content-type": "image/jpeg"})
+    ids = iter(["k1", "k2", "parent"])
+    create = respx.post(f"{BASE}/{IG}/media").mock(
+        side_effect=lambda req: httpx.Response(200, json={"id": next(ids)})
+    )
+    for cid in ("k1", "k2", "parent"):
+        respx.get(f"{BASE}/{cid}").respond(json={"status_code": "FINISHED"})
+    respx.post(f"{BASE}/{IG}/media_publish").respond(json={"id": "m1"})
+    respx.get(f"{BASE}/m1").respond(json={})
+
+    g.publish(
+        PublishRequest(media_type=MediaType.CAROUSEL, urls=["https://cdn/i1", "https://cdn/v1"])
+    )
+
+    bodies = [form(c.request) for c in create.calls]
+    assert "image_url" in bodies[0] and bodies[1]["video_url"] == "https://cdn/v1"
+
+
+@respx.mock
+def test_account_insights_periods():
+    g, _ = make()
+    route = respx.get(f"{BASE}/{IG}/insights").respond(json={"data": []})
+    g.account_insights(["reach", "follower_count", "online_followers"], period="week", days=7)
+    calls = {c.request.url.params["metric"]: c.request.url.params for c in route.calls}
+    assert calls["online_followers"]["period"] == "lifetime"
+    assert calls["follower_count"]["period"] == "day"
+    assert calls["reach"]["period"] == "day"  # total_value metrics only take 'day'
+
+
+@respx.mock
+def test_media_insights_instagram_host_falls_back_for_stories():
+    host = "https://graph.instagram.com/v23.0"
+    g, _ = make(graph_host="graph.instagram.com")
+    respx.get(f"{host}/s1").respond(json={"id": "s1", "media_type": "IMAGE"})
+    route = respx.get(f"{host}/s1/insights").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"code": 100, "message": "likes not supported"}}),
+            httpx.Response(200, json={"data": [{"name": "reach", "values": [{"value": 5}]}]}),
+        ]
+    )
+    out = g.media_insights("s1")
+    assert out[0].value == 5
+    assert route.calls[0].request.url.params["metric"].startswith("reach,views,likes")
+    assert route.calls[1].request.url.params["metric"] == "reach,views,shares,total_interactions"
+
+
+def test_discovery_and_hashtags_need_facebook_host():
+    g, _ = make(graph_host="graph.instagram.com")
+    with pytest.raises(NotSupported, match="Facebook Login"):
+        g.hashtag_media("coffee")
+    with pytest.raises(NotSupported, match="Facebook Login"):
+        g.get_profile("nike")
+    with pytest.raises(NotSupported, match="Facebook Login"):
+        g.list_media("nike")
+    assert not g.supports("hashtag_media") and not g.supports("delete_media")
+    assert make()[0].supports("hashtag_media")
+
+
+@respx.mock
+def test_resolve_ig_user_id_pages_and_ambiguity():
+    page2 = f"{BASE}/me/accounts?after=X"
+
+    def accounts(req: httpx.Request) -> httpx.Response:
+        if req.url.params.get("after"):
+            return httpx.Response(
+                200,
+                json={"data": [{"instagram_business_account": {"id": "22", "username": "two"}}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"instagram_business_account": {"id": "11", "username": "one"}}],
+                "paging": {"next": page2},
+            },
+        )
+
+    respx.get(f"{BASE}/me/accounts").mock(side_effect=accounts)
+    g = GraphBackend(Account(name="brand", username="two"), httpx.Client(), Config())
+    assert g.ig_user_id == "22"  # found on the second page
+    g = GraphBackend(Account(name="brand"), httpx.Client(), Config())
+    with pytest.raises(IgctlError, match="several Instagram accounts"):
+        _ = g.ig_user_id
+
+
+@respx.mock
+def test_network_errors_are_transient():
+    from igctl.backends.base import TransientError
+
+    g, _ = make()
+    respx.get(f"{BASE}/{IG}").mock(side_effect=httpx.ConnectError("down"))
+    with pytest.raises(TransientError):
+        g.me()
 
 
 def test_resolve_urls_keeps_urls():

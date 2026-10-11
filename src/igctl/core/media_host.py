@@ -19,14 +19,17 @@ import shlex
 import subprocess
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from igctl.backends.base import IgctlError
 from igctl.core.config import Config
 from igctl.core.models import PublishRequest
 
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic"})
+JPEG_SUFFIXES = frozenset({".jpg", ".jpeg"})
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"})
 
 PRESIGN_SECONDS = 3600
@@ -43,8 +46,76 @@ _HELP = (
 
 def is_video(name: str | Path) -> bool:
     """Whether a path or URL looks like a video file (by extension, ignoring query)."""
+    return url_suffix(name) in VIDEO_SUFFIXES
+
+
+def url_suffix(name: str | Path) -> str:
+    """Lower-case file suffix of a path or URL, ignoring any query string or fragment."""
     text = str(name).split("?", 1)[0].split("#", 1)[0]
-    return Path(text).suffix.lower() in VIDEO_SUFFIXES
+    return Path(urlparse(text).path if "://" in text else text).suffix.lower()
+
+
+def to_jpeg(path: Path, workdir: Path) -> Path:
+    """``path`` itself if it is a JPEG, else a JPEG copy written into ``workdir``.
+
+    The Graph API only accepts JPEG images. EXIF rotation is applied and transparency is
+    flattened onto white.
+    """
+    path = Path(path)
+    if path.suffix.lower() in JPEG_SUFFIXES:
+        return path
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im)
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                rgba = im.convert("RGBA")
+                flat = Image.new("RGB", rgba.size, (255, 255, 255))
+                flat.paste(rgba, mask=rgba.getchannel("A"))
+                im = flat
+            else:
+                im = im.convert("RGB")
+            out = workdir / f"{path.stem}-{uuid.uuid4().hex[:8]}.jpg"
+            im.save(out, "JPEG", quality=95)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise IgctlError(f"{path.name}: can't convert to JPEG ({exc}).") from exc
+    return out
+
+
+def graph_direct_upload(req: PublishRequest, graph_host: str, config: Config) -> bool:
+    """Whether the Graph backend can push ``req``'s local files itself (resumable upload).
+
+    Only videos on graph.facebook.com qualify, and only without a media host configured.
+    """
+    return (
+        graph_host.endswith("facebook.com")
+        and not config.media_host
+        and bool(req.paths)
+        and all(is_video(p) for p in req.paths)
+    )
+
+
+def check_graph_hostable(req: PublishRequest, graph_host: str, config: Config) -> None:
+    """Fail early when the Graph API could never fetch ``req``'s local files.
+
+    Shared by ``post`` (now and ``--at``), ``schedule add`` and ``schedule import`` so a
+    queued post doesn't fail hours later at publish time. Also rejects non-JPEG image URLs,
+    which the Graph API refuses (local files are converted automatically).
+    """
+    for url in req.urls:
+        suffix = url_suffix(url)
+        if suffix in IMAGE_SUFFIXES and suffix not in JPEG_SUFFIXES:
+            raise IgctlError(
+                f"{url}: the Graph API only accepts JPEG images, not '{suffix}'. Convert it, "
+                "or pass the local file so igctl converts and hosts it."
+            )
+    if config.media_host:
+        return
+    needs_host = bool(req.paths) and not graph_direct_upload(req, graph_host, config)
+    if needs_host or req.cover is not None:
+        raise IgctlError(
+            "The Graph API fetches media from public URLs. Pass --url, set `media_host` in "
+            "config.yaml, or use --backend private."
+        )
 
 
 def resolve_urls(req: PublishRequest, config: Config) -> PublishRequest:

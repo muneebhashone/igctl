@@ -79,6 +79,8 @@ def profile(
     ok(f"Downloaded {len(files)} file(s) from {len(media) - failed} post(s) to {out}")
     if c.json_output:
         emit(c, {"dest": str(out), "files": files, "failed": failed})
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command()

@@ -99,7 +99,7 @@ Account insights over a period (Graph API).
 |---|---|---|
 | `--days, -d` | int range | Look-back window. (default: `30`) |
 | `--metrics` | str | Comma-separated metrics. (default: `reach,views,accounts_engaged,total_interactions,follower_count`) |
-| `--period` | str | day \| week \| days_28 \| lifetime (default: `day`) |
+| `--period` | str | Only 'day' (the Graph API's sole period for these metrics); --days sets the range. (default: `day`) |
 | `--out, -o` | path | Also write the report to a .json or .csv file. |
 
 ### `igctl analyze audience`
@@ -122,7 +122,7 @@ Add (or re-authenticate) an account and verify the credentials work.
 | Parameter | Kind | Description |
 |---|---|---|
 | `NAME` | argument, required | |
-| `--backend` | str | graph \| private (default: `graph`) |
+| `--backend` | str | graph \| private (default: the global --backend, else graph) |
 | `--token` | str | Graph API access token. |
 | `--ig-user-id` | str | Instagram user id. |
 | `--host` | str | graph.facebook.com \| graph.instagram.com (default: `graph.facebook.com`) |
@@ -235,7 +235,7 @@ List direct-message threads.
 | Parameter | Kind | Description |
 |---|---|---|
 | `--unread` | flag | Only unread threads. |
-| `--limit, -n` | int |  (default: `20`) |
+| `--limit, -n` | int range | Max threads (0 = all). (default: `20`) |
 
 ### `igctl dm read`
 
@@ -244,7 +244,7 @@ Show the latest messages of a thread.
 | Parameter | Kind | Description |
 |---|---|---|
 | `THREAD` | argument, required | |
-| `--limit, -n` | int |  (default: `20`) |
+| `--limit, -n` | int range | Max messages (0 = all). (default: `20`) |
 
 ### `igctl dm send`
 
@@ -420,7 +420,7 @@ Search users.
 | Parameter | Kind | Description |
 |---|---|---|
 | `QUERY` | argument, required | |
-| `--limit, -n` | int |  (default: `20`) |
+| `--limit, -n` | int range |  (default: `20`) |
 
 ### `igctl engage hashtag`
 
@@ -430,7 +430,7 @@ List top (or recent) media for a hashtag.
 |---|---|---|
 | `TAG` | argument, required | |
 | `--recent` | flag | Recent instead of top media. |
-| `--limit, -n` | int |  (default: `30`) |
+| `--limit, -n` | int range |  (default: `30`) |
 
 ### `igctl engage bulk-like`
 
@@ -583,14 +583,14 @@ Queue a post to be published later.
 |---|---|---|
 | `FILES...` | argument, required | |
 | `--at` | str, required | When to publish: now, +30m, +2h, +1d, 'tomorrow 18:00', 'fri 9am', or ISO 2026-10-12T18:00. |
-| `--type, -t` | choice | Default: carousel for 2+ files, reel for video. |
+| `--type` | choice | Default: carousel for 2+ files, reel for video. |
 | `--caption, -c` | str | Post caption. (default: ``) |
 | `--caption-file` | path | Read the caption from a UTF-8 file. |
 | `--tz` | str | Time zone for naive times (IANA name, UTC or +05:00). Default: system local. |
 | `--account, -a` | str | Account alias. |
 | `--cover` | path | Reel/video cover image. |
 | `--location` | str | Location name. |
-| `--tag` | str, repeatable | Tag a user (repeatable). |
+| `--tag, -t` | str, repeatable | Tag a user (repeatable). |
 | `--no-feed` | flag | Reels: don't also share to the feed. |
 
 ### `igctl schedule import`

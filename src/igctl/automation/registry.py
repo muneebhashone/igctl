@@ -99,14 +99,17 @@ class RuleRun:
     def act(self, action: str, target: str | None, fn: Callable[[], T]) -> bool:
         """Perform one guarded write. True if it ran (or would have, in dry-run).
 
-        :class:`~igctl.backends.base.RateLimited` propagates so the engine stops the rule;
-        other errors are counted and swallowed so one bad item doesn't end the run.
+        Rate limits, action blocks, auth failures (expired session, challenge, suspension)
+        and unsupported operations propagate so the engine stops the rule: they would fail
+        for every remaining item, and repeating requests with a dead session is exactly what
+        Instagram flags. Other errors are counted and swallowed so one bad item doesn't end
+        the run.
         """
-        from igctl.backends.base import NotSupported, RateLimited
+        from igctl.backends.base import ActionBlocked, AuthError, NotSupported, RateLimited
 
         try:
             self.guard.act(action, target, fn)
-        except (RateLimited, NotSupported):
+        except (RateLimited, NotSupported, AuthError, ActionBlocked):
             raise
         except Exception as e:  # noqa: BLE001 - recorded in the action log by Guard
             self.stats.errors += 1

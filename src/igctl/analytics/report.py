@@ -71,8 +71,12 @@ def profile_report(
     tz: tzinfo = UTC,
     previous: dict | None = None,
     top_n: int = 5,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Full analytics for one account. ``previous`` is an earlier profile snapshot."""
+    """Full analytics for one account. ``previous`` is an earlier profile snapshot.
+
+    ``now`` ends the posting-frequency span, so a long silence lowers posts_per_week.
+    """
     followers = profile.followers_count
     posts = mx.feed_posts(media)
     weekdays = mx.best_weekdays(posts, tz)
@@ -88,7 +92,7 @@ def profile_report(
         "analyzed_posts": len(posts),
         "engagement_rate_pct": mx.engagement_rate(posts, followers),
         **mx.averages(posts),
-        "posts_per_week": mx.posts_per_week(posts),
+        "posts_per_week": mx.posts_per_week(posts, now=now),
         "best_weekday": weekdays[0]["weekday"] if weekdays else None,
         "best_hour": hours[0]["hour"] if hours else None,
         "top_media_type": max(types, key=lambda r: r["avg_engagement"] or 0)["media_type"]
@@ -136,7 +140,7 @@ def build_profile_report(
         previous = snaps[0] if snaps else None
         if snapshot:
             store.save_snapshot(account, "profile", profile.username, profile_snapshot(profile))
-    return profile_report(profile, media, tz, previous, top_n)
+    return profile_report(profile, media, tz, previous, top_n, now=datetime.now(UTC))
 
 
 def compare(reports: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -194,9 +198,9 @@ def hashtag_report(media: Sequence[Media], tag: str, top_n: int = 5) -> dict[str
     avgs = mx.averages(posts)
     dates = sorted(mx.as_tz(m.taken_at, UTC) for m in posts if m.taken_at)
     per_day = None
-    if len(dates) >= 2:
-        span_days = max((dates[-1] - dates[0]).total_seconds() / 86400, 1 / 24)
-        per_day = len(dates) / span_days
+    span_days = (dates[-1] - dates[0]).total_seconds() / 86400 if len(dates) >= 2 else 0
+    if span_days > 0:  # N posts span N-1 intervals
+        per_day = (len(dates) - 1) / span_days
     summary = {
         "hashtag": f"#{tag}",
         "sampled_posts": len(posts),

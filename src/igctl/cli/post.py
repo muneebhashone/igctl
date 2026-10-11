@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from igctl.backends.base import IgctlError
-from igctl.cli._common import confirm_or_abort, emit, get_ctx, ok, warn
+from igctl.cli._common import confirm_or_abort, emit, emit_ok, get_ctx, ok, warn
 from igctl.cli.download import resolve_media_ref
+from igctl.cli.schedule import check_hostable, queue_post
 from igctl.core.context import Context
-from igctl.core.media_host import is_video
+from igctl.core.files import read_text_file
 from igctl.core.models import MediaType, PublishRequest
 from igctl.core.validation import (  # noqa: F401 - re-exported
     FEED_MAX_RATIO,
@@ -26,21 +27,8 @@ from igctl.core.validation import (  # noqa: F401 - re-exported
     caption_problems,
     validate_request,
 )
-from igctl.scheduler.timeparse import TimeParseError, parse_when
 
 app = typer.Typer(no_args_is_help=True)
-
-
-def parse_at(value: str, now: datetime | None = None) -> datetime:
-    """``--at`` value (ISO-8601, ``+2h``, ``tomorrow 9am``...) to aware UTC; naive is local."""
-    now = now or datetime.now(UTC)
-    try:
-        dt = parse_when(value, now=now)
-    except TimeParseError as e:
-        raise IgctlError(f"Invalid --at '{value}': {e}") from e
-    if dt <= now:
-        raise IgctlError(f"--at {value} is in the past.")
-    return dt
 
 
 def _read_caption(caption: str | None, caption_file: Path | None) -> str:
@@ -49,10 +37,7 @@ def _read_caption(caption: str | None, caption_file: Path | None) -> str:
     if caption_file is not None:
         if str(caption_file) == "-":
             return sys.stdin.read().strip()
-        try:
-            return caption_file.read_text(encoding="utf-8").strip()
-        except OSError as e:
-            raise IgctlError(f"Can't read caption file: {e}") from e
+        return read_text_file(caption_file, "caption file").strip()
     return caption or ""
 
 
@@ -86,13 +71,8 @@ def _publish(
     what = f"{media_type} ({len(req.paths) or len(req.urls)} item(s))"
 
     if at:
-        run_at = parse_at(at)
-        if c.dry_run:
-            ok(f"(dry-run) would schedule {what} for {run_at.isoformat()}")
-            return
-        post_id = c.store.enqueue_post(c.account.name, req.model_dump_json(), run_at)
-        ok(f"Scheduled {what} as #{post_id} for {run_at.isoformat()} (account '{c.account.name}').")
-        emit(c, {"id": post_id, "run_at": run_at.isoformat(), "account": c.account.name})
+        # Same path as `schedule add`: one validation, one time parser, one JSON shape.
+        queue_post(c, c.account.name, req, at)
         return
 
     _publish_now(c, req, what, yes)
@@ -100,19 +80,13 @@ def _publish(
 
 def _publish_now(c: Context, req: PublishRequest, what: str, yes: bool) -> None:
     be = c.backend()
-    # graph.facebook.com accepts direct (resumable) uploads for videos; everything else
-    # must be fetched by Instagram from a public URL.
-    direct_upload = getattr(be, "is_facebook_host", False) and all(map(is_video, req.paths))
-    if be.name == "graph" and req.paths and not c.config.media_host and not direct_upload:
-        raise IgctlError(
-            "The Graph API fetches media from public URLs. Pass --url, set `media_host` in "
-            "config.yaml, or use --backend private."
-        )
+    check_hostable(c, c.account.name, req, be)
     confirm_or_abort(c, f"Publish {what} as account '{c.account.name}'?", yes)
     target = str(req.paths[0].name if req.paths else req.urls[0])
-    result = c.guard.act("publish", target, lambda: be.publish(req))
+    result = c.guard.act("publish", target, partial(be.publish, req))
     if result is None:
         ok(f"(dry-run) would publish {what} via {be.name}")
+        emit_ok(c, dry_run=True)
         return
     ok(f"Published {what}: {result.permalink or result.media_id}")
     emit(c, result)
@@ -244,15 +218,9 @@ def delete(
     confirm_or_abort(
         c, f"Delete media {media_id} from '{c.account.name}'? This can't be undone", yes
     )
-
-    def run() -> bool:
-        be.delete_media(media_id)
-        return True
-
-    if c.guard.act("delete", media_id, run) is None:
-        ok(f"(dry-run) would delete {media_id}")
-        return
-    ok(f"Deleted {media_id}")
+    c.guard.act("delete", media_id, partial(be.delete_media, media_id))
+    ok(f"(dry-run) would delete {media_id}" if c.dry_run else f"Deleted {media_id}")
+    emit_ok(c, media_id=media_id, action="delete", dry_run=c.dry_run)
 
 
 @app.command()
@@ -271,15 +239,12 @@ def edit(
         raise IgctlError(problem)
     be = c.backend()
     media_id = resolve_media_ref(be, media)
-
-    def run() -> bool:
-        be.edit_caption(media_id, text)
-        return True
-
-    if c.guard.act("edit", media_id, run) is None:
+    c.guard.act("edit", media_id, partial(be.edit_caption, media_id, text))
+    if c.dry_run:
         ok(f"(dry-run) would update the caption of {media_id}")
-        return
-    ok(f"Updated caption of {media_id}")
+    else:
+        ok(f"Updated caption of {media_id}")
+    emit_ok(c, media_id=media_id, action="edit", dry_run=c.dry_run)
 
 
 @app.command("list")
@@ -303,5 +268,5 @@ def list_posts(
             "comment_count",
             "caption",
         ],
-        title=f"@{username}" if username else "Recent posts",
+        title=f"@{username.lstrip('@')}" if username else "Recent posts",
     )

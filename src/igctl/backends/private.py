@@ -23,11 +23,20 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import pydantic
+import requests
 from instagrapi import Client
 from instagrapi import exceptions as ig
 from instagrapi import types as igt
 
-from igctl.backends.base import AuthError, Backend, IgctlError, RateLimited
+from igctl.backends.base import (
+    ActionBlocked,
+    AuthError,
+    Backend,
+    IgctlError,
+    RateLimited,
+    TransientError,
+)
 from igctl.core.config import Account, get_secret, sessions_dir
 from igctl.core.models import (
     Comment,
@@ -41,10 +50,14 @@ from igctl.core.models import (
     PublishResult,
     UserSummary,
 )
+from igctl.core.refs import shortcode_to_pk
 
 #: Random pause (seconds) instagrapi inserts before each private request.
 DEFAULT_DELAY_RANGE = [1, 3]
 FOLLOW_PAGE_SIZE = 100
+#: Upper bound for hashtag scans: instagrapi treats amount=0 as "page forever".
+MAX_HASHTAG_SCAN = 500
+MAX_USER_SEARCH = 50
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 _HASHTAG_RE = re.compile(r"#(\w+)", re.UNICODE)
 _SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,}$")
@@ -76,7 +89,7 @@ def map_error(exc: Exception) -> IgctlError:
         case ig.AccountSuspended():
             return AuthError(f"The Instagram account is suspended: {detail}")
         case ig.FeedbackRequired() | ig.SentryBlock():
-            return RateLimited(
+            return ActionBlocked(
                 f"Instagram blocked this action ({detail}). Stop automating for 24-48h and "
                 "lower the daily limits."
             )
@@ -88,17 +101,44 @@ def map_error(exc: Exception) -> IgctlError:
             return IgctlError(f"That account is private: {detail}")
         case ig.NotFoundError() | ig.ClientNotFoundError():
             return IgctlError(f"Not found: {detail}")
-        case ig.ClientConnectionError() | ig.ClientRequestTimeout():
-            return IgctlError(f"Network error talking to Instagram: {detail}")
+        case (
+            ig.ClientConnectionError()
+            | ig.ClientRequestTimeout()
+            | ig.ClientIncompleteReadError()
+            | requests.ConnectionError()
+            | requests.Timeout()
+            | httpx.TransportError()
+        ):
+            return TransientError(f"Network error talking to Instagram: {detail}")
         case ModuleNotFoundError() if "moviepy" in detail:
             return IgctlError(
                 "Video uploads need MoviePy and ffmpeg: `uv add moviepy` and install ffmpeg."
+            )
+        case AssertionError() if "login required" in detail.lower():
+            return AuthError("Instagram session expired or invalid; run `igctl auth login` again.")
+        case httpx.HTTPStatusError() | requests.HTTPError():
+            return IgctlError(f"Download failed: {detail}")
+        case pydantic.ValidationError() | KeyError():
+            return IgctlError(
+                f"Instagram returned an unexpected response ({type(exc).__name__}: {detail})."
             )
         case _:
             return IgctlError(f"Instagram error ({type(exc).__name__}): {detail}")
 
 
-_HANDLED: tuple[type[Exception], ...] = (ig.ClientError, ModuleNotFoundError)
+# instagrapi also raises bare AssertionErrors ("Login required"; its own ValidationError
+# subclasses AssertionError), KeyErrors and pydantic errors on unexpected payloads, and
+# requests errors from downloads (and igctl fetches --url media with httpx); none of these
+# may reach the CLI as a traceback.
+_HANDLED: tuple[type[Exception], ...] = (
+    ig.ClientError,
+    ModuleNotFoundError,
+    AssertionError,
+    KeyError,
+    pydantic.ValidationError,
+    requests.RequestException,
+    httpx.HTTPError,
+)
 
 
 @contextmanager
@@ -116,6 +156,25 @@ def _wrap[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
     def inner(*args: P.args, **kwargs: P.kwargs) -> R:
         with _translated():
             return fn(*args, **kwargs)
+
+    return inner
+
+
+def _write[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Like :func:`_wrap`, and persist the session after a successful write.
+
+    instagrapi rotates cookies, ``mid`` and authorization data as requests go out; long
+    automation/scheduler runs would otherwise leave a stale session file behind.
+    """
+    wrapped = _wrap(fn)
+
+    @functools.wraps(fn)
+    def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+        result = wrapped(*args, **kwargs)
+        self = args[0]
+        if isinstance(self, PrivateBackend):
+            self._persist_session()
+        return result
 
     return inner
 
@@ -233,14 +292,33 @@ def to_message(msg: igt.DirectMessage, thread_id: str | None = None) -> DirectMe
     )
 
 
+def _from_me(msg: igt.DirectMessage, my_user_id: str | None) -> bool | None:
+    if msg.is_sent_by_viewer is not None:
+        return bool(msg.is_sent_by_viewer)
+    if my_user_id and msg.user_id is not None:
+        return str(msg.user_id) == str(my_user_id)
+    return None
+
+
+def _thread_unread(
+    thread: igt.DirectThread, last: igt.DirectMessage | None, from_me: bool | None, me: str | None
+) -> bool:
+    """Newest message is from someone else and newer than my last-seen marker."""
+    if last is None or from_me is not False:
+        return False
+    seen = (thread.last_seen_at or {}).get(str(me)) if me else None
+    seen_at = getattr(seen, "timestamp", None)
+    if seen_at is None or last.timestamp is None:
+        return True
+    a, b = seen_at, last.timestamp
+    if (a.tzinfo is None) != (b.tzinfo is None):  # compare naive with aware as UTC
+        a, b = a.replace(tzinfo=None), b.replace(tzinfo=None)
+    return a < b
+
+
 def to_thread(thread: igt.DirectThread, my_user_id: str | None = None) -> DirectThread:
     last = thread.messages[0] if thread.messages else None
-    unread = False
-    if my_user_id:
-        try:
-            unread = not thread.is_seen(str(my_user_id))
-        except (KeyError, AttributeError):
-            unread = False
+    from_me = _from_me(last, my_user_id) if last else None
     return DirectThread(
         id=str(thread.id),
         title=thread.thread_title or None,
@@ -248,8 +326,11 @@ def to_thread(thread: igt.DirectThread, my_user_id: str | None = None) -> Direct
         last_message=(last.text or (f"[{last.item_type}]" if last.item_type else None))
         if last
         else None,
+        last_message_id=_s(last.id) if last else None,
+        last_sender_id=_s(last.user_id) if last else None,
+        last_from_me=from_me,
         last_activity_at=thread.last_activity_at,
-        unread=unread,
+        unread=_thread_unread(thread, last, from_me, my_user_id),
     )
 
 
@@ -321,6 +402,42 @@ def parse_usertag(spec: str, index: int = 0) -> tuple[str, float, float]:
     return name, 0.5 + offset, 0.5 + offset
 
 
+#: Sticker sizes as fractions of the story frame (width, height).
+STORY_MENTION_SIZE = (0.5, 0.08)
+STORY_LOCATION_SIZE = (0.5, 0.1)
+
+
+def story_sticker_position(spec: str, index: int = 0) -> tuple[str, float, float]:
+    """``"name"`` or ``"name:x,y"`` -> (username, x, y) centre of a story mention sticker.
+
+    Untagged positions stack vertically so several mentions don't overlap.
+    """
+    name, x, y = parse_usertag(spec, index)
+    if ":" not in spec:
+        x, y = 0.5, min(0.3 + 0.1 * index, 0.9)
+    return name, x, y
+
+
+_POST_SEGMENTS = frozenset({"p", "reel", "reels", "tv"})
+
+
+def media_pk_from_path(parts: list[str]) -> str:
+    """Media pk from URL path segments, e.g. ``["p", "CODE", "embed"]``.
+
+    Accepts ``/p|reel|reels|tv/<code>/...`` (optionally after a ``/<username>/`` prefix)
+    and ``/stories/<user>/<pk>/``; anything else is rejected rather than misdecoded.
+    """
+    if len(parts) >= 3 and parts[0] == "stories" and parts[2].isdigit():
+        return parts[2]
+    for i, seg in enumerate(parts[:2]):
+        if seg in _POST_SEGMENTS and i + 1 < len(parts):
+            return str(shortcode_to_pk(parts[i + 1]))
+    raise ValueError(
+        "Not an Instagram post, reel or story URL (expected /p/<code>/, /reel/<code>/ or "
+        f"/stories/<user>/<id>/): /{'/'.join(parts)}"
+    )
+
+
 class PrivateBackend(Backend):
     name = "private"
 
@@ -346,6 +463,15 @@ class PrivateBackend(Backend):
     def save_session(self) -> None:
         self.client.dump_settings(self.session_path)
 
+    def _persist_session(self) -> None:
+        """Best-effort :meth:`save_session` after writes (never fails the action)."""
+        if not self._authenticated:
+            return
+        try:
+            self.save_session()
+        except (OSError, TypeError, ValueError):
+            pass
+
     def _load_session(self) -> bool:
         path = self.session_path
         if not path.exists():
@@ -356,13 +482,6 @@ class PrivateBackend(Backend):
             return False
         return True
 
-    def _reset_preserving_device(self) -> None:
-        """Drop the dead session but keep device uuids so Instagram sees the same phone."""
-        uuids = self.client.get_settings().get("uuids") or {}
-        self.client.set_settings({})
-        if uuids:
-            self.client.set_uuids(uuids)
-
     @_wrap
     def login(
         self,
@@ -372,19 +491,25 @@ class PrivateBackend(Backend):
     ) -> Profile:
         """Authenticate, reusing the saved session when it is still valid.
 
-        Falls back to a password login (password from the argument or the keyring
-        ``<account>:password``); ``verification_code`` answers a 2FA prompt.
+        With an explicit ``password`` (``igctl auth login``) the credentials are always
+        checked by a real login, so a stale session of another account (or from before a
+        password change) is never reused. Otherwise a valid saved session is reused and a
+        password login (password from the keyring ``<account>:password``) is the fallback.
+        ``verification_code`` answers a 2FA prompt. The saved device identity is kept.
         """
+        explicit = password is not None
         username = username or self.account.username
         password = password or get_secret(self.account.name, "password")
         code = verification_code or ""
 
-        if self._load_session():
+        loaded = self._load_session()
+        self._authenticated = False
+        if loaded and not explicit:
             try:
                 self.client.get_timeline_feed()  # cheap probe that the session still works
                 self._authenticated = True
             except (ig.LoginRequired, ig.ClientLoginRequired, ig.ClientUnauthorizedError):
-                self._reset_preserving_device()
+                pass
 
         if not self._authenticated:
             if not username or not password:
@@ -392,7 +517,9 @@ class PrivateBackend(Backend):
                     f"No valid session for account '{self.account.name}' and no stored "
                     "credentials; run `igctl auth login`."
                 )
-            self.client.login(username, password, verification_code=code)
+            # relogin=True clears only auth state and cookies of a loaded session and keeps
+            # its device settings, so Instagram keeps seeing the same phone.
+            self.client.login(username, password, relogin=loaded, verification_code=code)
             self._authenticated = True
 
         self.save_session()
@@ -423,7 +550,7 @@ class PrivateBackend(Backend):
         """Accept a full id, pk, shortcode or post URL; return something instagrapi takes."""
         ref = ref.strip()
         if ref.startswith(("http://", "https://")):
-            return str(self.client.media_pk_from_url(ref))  # parsing only; no login
+            return self._pk_from_url(ref)
         if "_" in ref and ref.split("_", 1)[0].isdigit():
             return ref
         if ref.isdigit():
@@ -499,11 +626,14 @@ class PrivateBackend(Backend):
     def hashtag_media(self, tag: str, limit: int = 50, recent: bool = False) -> list[Media]:
         name = tag.lstrip("#")
         fetch = self.c.hashtag_medias_recent_v1 if recent else self.c.hashtag_medias_top_v1
-        return [to_media(m) for m in fetch(name, amount=limit)[:limit]]
+        # Never pass amount=0: instagrapi would page through the whole hashtag.
+        amount = min(limit, MAX_HASHTAG_SCAN) if limit > 0 else MAX_HASHTAG_SCAN
+        return [to_media(m) for m in fetch(name, amount=amount)[:amount]]
 
     @_wrap
     def search_users(self, query: str, limit: int = 20) -> list[UserSummary]:
-        return [to_user_summary(u) for u in self.c.search_users_v1(query, limit)[:limit]]
+        count = min(limit, MAX_USER_SEARCH) if limit > 0 else MAX_USER_SEARCH
+        return [to_user_summary(u) for u in self.c.search_users_v1(query, count)[:count]]
 
     # ------------------------------------------------------------------ insights
     @_wrap
@@ -560,7 +690,7 @@ class PrivateBackend(Backend):
                 paths.append(dest)
         return paths
 
-    @_wrap
+    @_write
     def publish(self, req: PublishRequest) -> PublishResult:
         c = self.c
         with tempfile.TemporaryDirectory(prefix="igctl-") as tmp:
@@ -610,11 +740,37 @@ class PrivateBackend(Backend):
         cover: Path | None,
         location: igt.Location | None,
     ) -> PublishResult:
-        """Each file becomes one story frame; the result refers to the last frame."""
-        mentions = [
-            igt.StoryMention(user=self._user_short(parse_usertag(t)[0])) for t in req.user_tags
-        ]
-        locations = [igt.StoryLocation(location=location)] if location else []
+        """Each file becomes one story frame; the result refers to the last frame.
+
+        Stickers need explicit geometry: instagrapi copies x/y/width/height verbatim, and
+        nulls make Instagram drop the sticker or reject the upload. (instagrapi 3.0.21 keeps
+        only the last mention in ``reel_mentions``; all of them still go out as tap models.)
+        """
+        mentions = []
+        for i, spec in enumerate(req.user_tags):
+            name, x, y = story_sticker_position(spec, i)
+            mentions.append(
+                igt.StoryMention(
+                    user=self._user_short(name),
+                    x=x,
+                    y=y,
+                    width=STORY_MENTION_SIZE[0],
+                    height=STORY_MENTION_SIZE[1],
+                )
+            )
+        locations = (
+            [
+                igt.StoryLocation(
+                    location=location,
+                    x=0.5,
+                    y=0.8,
+                    width=STORY_LOCATION_SIZE[0],
+                    height=STORY_LOCATION_SIZE[1],
+                )
+            ]
+            if location
+            else []
+        )
         story: igt.Story | None = None
         for path in paths:
             kwargs: dict[str, Any] = {
@@ -630,17 +786,17 @@ class PrivateBackend(Backend):
         mapped = story_to_media(story)
         return PublishResult(media_id=mapped.id, permalink=mapped.permalink, backend=self.name)
 
-    @_wrap
+    @_write
     def delete_media(self, media_id: str) -> None:
         if not self.c.media_delete(self._media_id(media_id)):
             raise IgctlError(f"Instagram refused to delete media {media_id}.")
 
-    @_wrap
+    @_write
     def edit_caption(self, media_id: str, caption: str) -> None:
         self.c.media_edit(self._media_id(media_id), caption)
 
     # ---------------------------------------------------------------- engagement
-    @_wrap
+    @_write
     def comment(self, media_id: str, text: str, reply_to: str | None = None) -> Comment:
         mid = self._media_id(media_id)
         result = self.c.media_comment(
@@ -648,27 +804,27 @@ class PrivateBackend(Backend):
         )
         return to_comment(result, mid)
 
-    @_wrap
+    @_write
     def delete_comment(self, media_id: str, comment_id: str) -> None:
         self.c.comment_bulk_delete(self._media_id(media_id), [int(comment_id)])
 
-    @_wrap
+    @_write
     def like_comment(self, comment_id: str, unlike: bool = False) -> None:
         self.c.comment_like(int(comment_id), revert=unlike)
 
-    @_wrap
+    @_write
     def like(self, media_id: str) -> None:
         self.c.media_like(self._media_id(media_id))
 
-    @_wrap
+    @_write
     def unlike(self, media_id: str) -> None:
         self.c.media_unlike(self._media_id(media_id))
 
-    @_wrap
+    @_write
     def follow(self, username: str) -> None:
         self.c.user_follow(self._user_id(username))
 
-    @_wrap
+    @_write
     def unfollow(self, username: str) -> None:
         self.c.user_unfollow(self._user_id(username))
 
@@ -702,7 +858,18 @@ class PrivateBackend(Backend):
 
     @_wrap
     def media_pk_from_url(self, url: str) -> str:
-        return str(self.client.media_pk_from_url(url))
+        return self._pk_from_url(url)
+
+    def _pk_from_url(self, url: str) -> str:
+        """Post/reel/tv/story URL -> media pk. Only ``/share/`` links need a request."""
+        parts = [p for p in urlparse(url).path.split("/") if p]
+        if parts[:1] == ["share"]:
+            # Short share links only redirect to the canonical URL: one public request.
+            return str(self.client.media_pk_from_url(url))
+        try:
+            return media_pk_from_path(parts)
+        except ValueError as e:
+            raise IgctlError(str(e)) from e
 
     # -------------------------------------------------------------------- direct
     @_wrap
@@ -710,25 +877,25 @@ class PrivateBackend(Backend):
         c = self.c
         threads = c.direct_threads(amount=limit, selected_filter="unread" if unread_only else None)
         me = _s(c.user_id)
-        return [to_thread(t, me) for t in threads[:limit]]
+        return [to_thread(t, me) for t in (threads[:limit] if limit else threads)]
 
     @_wrap
     def thread_messages(self, thread_id: str, limit: int = 20) -> list[DirectMessage]:
         msgs = self.c.direct_messages(int(thread_id), amount=limit)
-        return [to_message(m, thread_id) for m in msgs[:limit]]
+        return [to_message(m, thread_id) for m in (msgs[:limit] if limit else msgs)]
 
-    @_wrap
+    @_write
     def send_dm(self, usernames: list[str], text: str) -> DirectMessage:
         if not usernames:
             raise IgctlError("send_dm needs at least one recipient.")
         user_ids = [int(self._user_id(u)) for u in usernames]
         return to_message(self.c.direct_send(text, user_ids=user_ids))
 
-    @_wrap
+    @_write
     def reply_dm(self, thread_id: str, text: str) -> DirectMessage:
         return to_message(self.c.direct_answer(int(thread_id), text), thread_id)
 
-    @_wrap
+    @_write
     def mark_thread_seen(self, thread_id: str) -> None:
         self.c.direct_send_seen(int(thread_id))
 

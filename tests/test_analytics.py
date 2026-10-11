@@ -84,9 +84,12 @@ def test_averages():
 
 def test_posts_per_week():
     media = [m(i, when=MON + timedelta(days=i)) for i in range(15)]  # 15 posts in 14 days
-    assert mx.posts_per_week(media) == pytest.approx(7.5)
+    assert mx.posts_per_week(media) == pytest.approx(7.0)
     assert mx.posts_per_week(media[:1]) is None
-    assert mx.posts_per_week(media, now=MON + timedelta(days=28)) == pytest.approx(15 / 28 * 7)
+    assert mx.posts_per_week(media, now=MON + timedelta(days=28)) == pytest.approx(14 / 28 * 7)
+    # Two posts a week apart are one post per week; same-day posts give no rate.
+    assert mx.posts_per_week([m(1), m(2, when=MON + timedelta(days=7))]) == pytest.approx(1.0)
+    assert mx.posts_per_week([m(1), m(2)]) is None
 
 
 def test_best_weekday_and_hour_respect_timezone():
@@ -243,7 +246,7 @@ def test_hashtag_report():
     r = rp.hashtag_report(media, "#Tag")
     assert r["summary"]["hashtag"] == "#tag"
     assert r["summary"]["avg_engagement"] == 20
-    assert r["summary"]["sample_posts_per_day"] == pytest.approx(4)
+    assert r["summary"]["sample_posts_per_day"] == pytest.approx(2)
     assert r["related_hashtags"][0]["hashtag"] == "#other"
 
 
@@ -462,3 +465,61 @@ def test_cli_not_supported_hint(cli, monkeypatch):
     r = cli("hashtag", "x")
     assert r.exit_code == 1
     assert "--backend private" in " ".join(r.output.split())
+
+
+# --- regressions -----------------------------------------------------------------
+
+
+def test_follower_diff_skips_categories_of_truncated_snapshots():
+    cur = fl.to_snapshot([u(1), u(2)])
+    prev = fl.to_snapshot([u(2), u(3)])
+    d = fl.diff(cur, cur, prev, prev, complete={"followers": False})
+    assert "lost_followers" not in d and "new_followers" not in d
+    assert "not_following_back" not in d and "fans" not in d
+    assert set(d["skipped"]) == {"new_followers", "lost_followers", "not_following_back", "fans"}
+    assert "new_following" in d  # the following lists are complete
+
+
+def test_cli_followers_limit_is_flagged(cli):
+    cli.backend.fr = [u(1), u(2), u(3)]
+    assert cli("followers", "--limit", "2").exit_code == 0
+    cli.backend.fr = [u(4), u(1), u(2)]  # u4 followed; the window pushes u2 out
+    r = cli("followers", "--limit", "2")
+    data = _json(r.stdout)
+    assert "lost_followers" not in data and "lost_followers" in data["skipped"]
+    assert "--limit" in r.stderr
+
+
+def test_cli_dry_run_writes_no_snapshots(cli):
+    ctx = Context(json_output=True, dry_run=True)
+    ctx.__dict__["store"] = cli.ctx.store
+    ctx.__dict__["account"] = cli.ctx.account
+    assert cli("profile", ctx=ctx).exit_code == 0
+    r = cli("followers", ctx=ctx)
+    assert r.exit_code == 1  # nothing stored to diff yet
+    assert cli.ctx.store._conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
+
+
+def test_cli_post_accepts_url_and_shortcode(cli):
+    seen = []
+    cli.backend.get_media = lambda media_id: seen.append(media_id) or sample_media()[0]
+    code = sample_media()[0].code
+    r = cli("post", f"https://www.instagram.com/p/{code}/")
+    assert r.exit_code == 0, r.output
+    assert seen == [sample_media()[0].id]  # graph: shortcode looked up among own posts
+
+
+def test_cli_insights_rejects_unsupported_period(cli):
+    r = cli("insights", "--period", "week")
+    assert r.exit_code != 0 and "day" in r.output
+
+
+def test_resolve_tz_rejects_out_of_range_offsets():
+    from igctl.scheduler.timeparse import TimeParseError
+    from igctl.scheduler.timeparse import resolve_tz as sched_tz
+
+    with pytest.raises(IgctlError, match="offset"):
+        mx.resolve_tz("+25")
+    with pytest.raises(TimeParseError, match="offset"):
+        sched_tz("+24:00")
+    assert sched_tz("-23:59") is not None

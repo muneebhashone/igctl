@@ -8,7 +8,7 @@ import httpx
 import typer
 
 from igctl.backends.base import AuthError, IgctlError
-from igctl.cli._common import emit, get_ctx, ok, warn
+from igctl.cli._common import emit, emit_ok, get_ctx, ok, warn
 from igctl.core.config import Account, Config, delete_secret, get_secret, sessions_dir, set_secret
 from igctl.core.context import make_backend
 
@@ -30,7 +30,9 @@ def _validate_name(name: str) -> str:
 def login(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Local alias for this account, e.g. 'brand'."),
-    backend: str = typer.Option("graph", "--backend", help="graph | private"),
+    backend: str | None = typer.Option(
+        None, "--backend", help="graph | private (default: the global --backend, else graph)"
+    ),
     token: str | None = typer.Option(None, "--token", help="Graph API access token."),
     ig_user_id: str | None = typer.Option(None, "--ig-user-id", help="Instagram user id."),
     host: str = typer.Option("graph.facebook.com", "--host", help=" | ".join(GRAPH_HOSTS)),
@@ -43,6 +45,13 @@ def login(
     """Add (or re-authenticate) an account and verify the credentials work."""
     c = get_ctx(ctx)
     _validate_name(name)
+    # `igctl --backend private auth login ...` (the global option) must work too.
+    if backend and c.backend_override and backend != c.backend_override:
+        raise typer.BadParameter(
+            f"conflicting backends: global --backend {c.backend_override}, login --backend "
+            f"{backend}"
+        )
+    backend = backend or c.backend_override or "graph"
     if backend not in ("graph", "private"):
         raise typer.BadParameter("--backend must be 'graph' or 'private'")
     cfg = Config.load()
@@ -132,6 +141,7 @@ def use(ctx: typer.Context, name: str = typer.Argument(...)) -> None:
     cfg.default_account = name
     cfg.save()
     ok(f"Default account is now '{name}'.")
+    emit_ok(get_ctx(ctx), default_account=name)
 
 
 @app.command()
@@ -179,6 +189,7 @@ def logout(
         ok(f"Removed account '{name}'.")
     else:
         ok(f"Logged out of '{name}' (credentials and session removed).")
+    emit_ok(get_ctx(ctx), account=name, purged=purge)
 
 
 @app.command("set-limit")

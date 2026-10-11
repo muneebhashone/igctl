@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from itertools import islice
 from pathlib import Path
 from typing import Annotated, Any
@@ -23,9 +24,10 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from igctl.backends.base import AuthError, Backend, NotSupported, RateLimited
-from igctl.cli._common import confirm_or_abort, emit, err_console, get_ctx, ok, warn
+from igctl.backends.base import ActionBlocked, AuthError, Backend, NotSupported, RateLimited
+from igctl.cli._common import confirm_or_abort, emit, emit_ok, err_console, get_ctx, ok, warn
 from igctl.core.context import Context
+from igctl.core.files import read_text_file
 from igctl.core.refs import (  # noqa: F401 - re-exported for other CLI modules
     normalize_username,
     pk_to_shortcode,
@@ -48,7 +50,7 @@ COMMENT_COLUMNS = ["id", "username", "text", "created_at", "like_count"]
 def read_lines(path: Path, usernames: bool = True) -> list[str]:
     """Non-empty, non-comment lines of ``path``, de-duplicated in order."""
     seen: dict[str, None] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_text_file(path, "list file").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -93,8 +95,9 @@ def run_bulk(
 ) -> BulkResult:
     """Run ``(target, fn)`` pairs through the guard as ``action``.
 
-    Stops at the first :class:`RateLimited`; :class:`NotSupported` / :class:`AuthError`
-    abort (they would fail for every item); other errors are recorded and skipped.
+    Stops at the first :class:`RateLimited` / :class:`ActionBlocked`; :class:`NotSupported`
+    and :class:`AuthError` abort (they would fail for every item); other errors are recorded
+    and skipped.
     ``on_success`` is called with the target after each real (non dry-run) success.
     """
     res = BulkResult(action=action, total=len(items), dry_run=c.dry_run)
@@ -114,7 +117,7 @@ def run_bulk(
             bar.update(task, target=target)
             try:
                 c.guard.act(action, target, fn)
-            except RateLimited as e:
+            except (RateLimited, ActionBlocked) as e:
                 res.stopped = str(e)
                 break
             except (NotSupported, AuthError):
@@ -131,6 +134,7 @@ def run_bulk(
 
 
 def report_bulk(c: Context, res: BulkResult, title: str) -> None:
+    """Print the outcome; exit 1 if any item failed or the run stopped early."""
     for err in res.errors:
         warn(f"{err['target']}: {err['error']}")
     if res.stopped:
@@ -139,6 +143,8 @@ def report_bulk(c: Context, res: BulkResult, title: str) -> None:
     if not c.json_output:
         data.pop("errors")
     emit(c, data, title=title)
+    if res.failed or res.stopped:
+        raise typer.Exit(1)
 
 
 def _each(
@@ -146,7 +152,7 @@ def _each(
 ) -> None:
     """Apply a guarded single action to one or more targets (non-bulk commands)."""
     targets = list(targets)
-    items = [(t, (lambda t=t: fn(t))) for t in targets]
+    items = [(t, partial(fn, t)) for t in targets]
     res = run_bulk(c, action, items, progress=len(items) > 1)
     for err in res.errors:
         warn(f"{err['target']}: {err['error']}")
@@ -167,6 +173,11 @@ def _single(c: Context, action: str, target: str, fn: Callable[[], Any], msg: st
         warn(f"[dry-run] would {msg}")
     else:
         ok(msg)
+    if c.json_output:
+        if result is None:
+            emit_ok(c, action=action, target=target, dry_run=c.dry_run)
+        else:
+            emit(c, result)
     return result
 
 
@@ -217,11 +228,9 @@ def comment(
     c = get_ctx(ctx)
     b = c.backend()
     mid = _media_or_bad(b, media)
-    result = _single(
-        c, "comment", mid, lambda: b.comment(mid, text, reply_to=reply_to), f"commented on {mid}"
+    _single(
+        c, "comment", mid, partial(b.comment, mid, text, reply_to=reply_to), f"commented on {mid}"
     )
-    if result is not None and c.json_output:
-        emit(c, result)
 
 
 @app.command("comments")
@@ -251,7 +260,7 @@ def delete_comment(
         c,
         "delete_comment",
         comment_id,
-        lambda: b.delete_comment(mid, comment_id),
+        partial(b.delete_comment, mid, comment_id),
         f"deleted comment {comment_id}",
     )
 
@@ -270,7 +279,7 @@ def hide_comment(
         c,
         "hide_comment",
         comment_id,
-        lambda: b.hide_comment(comment_id, hide=not unhide),
+        partial(b.hide_comment, comment_id, hide=not unhide),
         f"{verb} comment {comment_id}",
     )
 
@@ -296,6 +305,9 @@ def purge_comments(
     hits = [cm for cm in b.list_comments(mid, limit=limit) if pattern.search(cm.text)]
     if not hits:
         ok("No matching comments.")
+        if c.json_output:
+            action = "hide_comment" if hide else "delete_comment"
+            emit(c, asdict(BulkResult(action=action, total=0, dry_run=c.dry_run)))
         return
     if not c.json_output:
         emit(c, hits, COMMENT_COLUMNS, title=f"{len(hits)} matching comments")
@@ -303,10 +315,10 @@ def purge_comments(
     confirm_or_abort(c, f"{verb} {len(hits)} comment(s)?", yes)
     if hide:
         action = "hide_comment"
-        items = [(cm.id, (lambda cid=cm.id: b.hide_comment(cid, hide=True))) for cm in hits]
+        items = [(cm.id, partial(b.hide_comment, cm.id, hide=True)) for cm in hits]
     else:
         action = "delete_comment"
-        items = [(cm.id, (lambda cid=cm.id: b.delete_comment(mid, cid))) for cm in hits]
+        items = [(cm.id, partial(b.delete_comment, mid, cm.id)) for cm in hits]
     report_bulk(c, run_bulk(c, action, items, label=f"{verb.lower()} comments"), "purge-comments")
 
 
@@ -364,7 +376,7 @@ def following(ctx: typer.Context, user: OptUser = None, limit: Limit = 50) -> No
 def search(
     ctx: typer.Context,
     query: Annotated[str, typer.Argument(help="Search text.")],
-    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 20,
 ) -> None:
     """Search users."""
     c = get_ctx(ctx)
@@ -376,7 +388,7 @@ def hashtag(
     ctx: typer.Context,
     tag: Annotated[str, typer.Argument(help="Hashtag, with or without #.")],
     recent: Annotated[bool, typer.Option("--recent", help="Recent instead of top media.")] = False,
-    limit: Annotated[int, typer.Option("--limit", "-n")] = 30,
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 30,
 ) -> None:
     """List top (or recent) media for a hashtag."""
     c = get_ctx(ctx)
@@ -406,7 +418,7 @@ def bulk_like(
     tag = tag.lstrip("#")
     with err_console.status(f"Fetching #{tag}..."):
         media = b.hashtag_media(tag, limit=max_actions, recent=recent)[:max_actions]
-    items = [(m.id, (lambda mid=m.id: b.like(mid))) for m in media]
+    items = [(m.id, partial(b.like, m.id)) for m in media]
     report_bulk(c, run_bulk(c, "like", items, label=f"like #{tag}"), "bulk-like")
 
 
@@ -423,7 +435,7 @@ def bulk_follow(
     c = get_ctx(ctx)
     b = c.backend()
     users = read_lines(from_file)[:max_actions]
-    items = [(u, (lambda u=u: b.follow(u))) for u in users]
+    items = [(u, partial(b.follow, u)) for u in users]
     report_bulk(c, run_bulk(c, "follow", items, label="follow"), "bulk-follow")
 
 
@@ -464,8 +476,10 @@ def bulk_unfollow(
     targets = targets[:max_actions]
     if not targets:
         ok("Nothing to unfollow.")
+        if c.json_output:
+            emit(c, asdict(BulkResult(action="unfollow", total=0, dry_run=c.dry_run)))
         return
     preview = ", ".join(targets[:10]) + (" ..." if len(targets) > 10 else "")
     confirm_or_abort(c, f"Unfollow {len(targets)} account(s)? ({preview})", yes)
-    items = [(u, (lambda u=u: b.unfollow(u))) for u in targets]
+    items = [(u, partial(b.unfollow, u)) for u in targets]
     report_bulk(c, run_bulk(c, "unfollow", items, label="unfollow"), "bulk-unfollow")

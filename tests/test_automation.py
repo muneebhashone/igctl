@@ -408,3 +408,156 @@ def test_cli_commands(home, fake, tmp_path):
     bad.write_text("- name: x\n  trigger: nope\n", encoding="utf-8")
     res = runner.invoke(automate_app, ["validate", str(bad)])
     assert res.exit_code != 0 and isinstance(res.exception, RulesError)
+
+
+# --- regressions -------------------------------------------------------------
+
+
+def test_auth_error_stops_rule_and_account(home, fake):
+    from igctl.backends.base import AuthError
+
+    calls = []
+
+    def dead(username: str) -> None:
+        calls.append(username)
+        raise AuthError("session expired")
+
+    fake.follow = dead  # type: ignore[method-assign]
+    fake.follower_list = [_user("a"), _user("b"), _user("c")]
+    rules = [
+        {"name": "f1", "trigger": {"type": "follow_from", "user": "src"}},
+        {"name": "f2", "trigger": {"type": "follow_from", "user": "src2"}},
+    ]
+    r1, r2 = run(rules, fake)
+    assert calls == ["a"]  # no more requests with a dead session
+    assert r1.status == "error" and "session expired" in r1.message
+    assert r2.status == "halted"
+
+
+def test_action_block_halts_account_across_runs(home, fake):
+    from igctl.backends.base import ActionBlocked
+
+    def blocked(media_id: str) -> None:
+        raise ActionBlocked("feedback_required")
+
+    fake.like = blocked  # type: ignore[method-assign]
+    fake.tag_media = {"cats": [Media(id="a", media_type=MediaType.IMAGE, owner_username="x")]}
+    rule = {"name": "tags", "trigger": {"type": "hashtag_engage", "tags": ["cats"]}}
+    [res] = run([rule], fake)
+    assert res.status == "blocked"
+    # A fresh engine (e.g. the next cron run) still respects the persisted 24h cooldown.
+    [res] = run([rule], fake)
+    assert res.status == "halted" and "feedback_required" in res.message
+
+
+def test_dm_autoreply_never_answers_itself(home, fake):
+    rule = {
+        "name": "dms",
+        "trigger": {"type": "dm_autoreply", "unread_only": False, "once_per_thread": False},
+        "action": {"reply": "Thanks {username}"},
+    }
+    fake.threads = [
+        DirectThread(
+            id="t1", users=[_user("ann")], last_message="hi", last_message_id="m1",
+            last_from_me=False,
+        ),
+        DirectThread(id="t2", users=[_user("ben")], last_message="my dm", last_from_me=True),
+        DirectThread(id="t3", users=[_user("cy")], last_message="x", last_sender_id="me-id"),
+    ]  # fmt: skip
+    run([rule], fake)
+    assert [c[1] for c in fake.calls if c[0] == "reply_dm"] == ["t1"]
+    # Our reply is now the newest message (and bumped the activity time): no new reply.
+    fake.threads = [
+        DirectThread(
+            id="t1", users=[_user("ann")], last_message="Thanks ann", last_message_id="m2",
+            last_from_me=True, last_activity_at=datetime.now(UTC),
+        )
+    ]  # fmt: skip
+    fake.calls.clear()
+    run([rule], fake)
+    assert fake.calls == []
+
+
+def test_welcome_dm_ignores_old_followers_sliding_into_window(home, fake):
+    rule = {
+        "name": "welcome",
+        "trigger": {"type": "welcome_dm", "scan_limit": 2},
+        "action": {"message": "Hi"},
+    }
+    fake.follower_list = [_user("b"), _user("a"), _user("old")]
+    run([rule], fake)  # baseline: window [b, a]
+    fake.follower_list = [_user("new"), _user("b"), _user("old")]  # 'a' unfollowed
+    run([rule], fake)
+    assert fake.calls == [("send_dm", ("new",), "Hi")]
+    fake.follower_list = [_user("b"), _user("old")]  # 'new' left; 'old' slides into window
+    fake.calls.clear()
+    run([rule], fake)
+    assert fake.calls == []
+    ctx = make_ctx(fake)
+    rows = ctx.store._conn.execute(
+        "SELECT COUNT(*) FROM snapshots WHERE kind='automation:followers'"
+    ).fetchone()[0]
+    assert rows == 1  # state is upserted, not appended every run
+
+
+def test_welcome_dm_retries_failed_dms(home, fake):
+    attempts = []
+
+    def flaky(usernames: list[str], text: str) -> DirectMessage:
+        attempts.append(usernames[0])
+        if len(attempts) == 1:
+            raise RuntimeError("network blip")
+        return DirectMessage(id="dm", thread_id="t")
+
+    rule = {"name": "welcome", "trigger": "welcome_dm", "action": {"message": "Hi"}}
+    fake.follower_list = [_user("old")]
+    run([rule], fake)
+    fake.send_dm = flaky  # type: ignore[method-assign]
+    fake.follower_list = [_user("new"), _user("old")]
+    [res] = run([rule], fake)
+    assert res.errors == 1 and "queued" in res.message
+    run([rule], fake)
+    assert attempts == ["new", "new"]
+    run([rule], fake)
+    assert attempts == ["new", "new"]  # delivered; not sent again
+
+
+def test_unfollow_min_days_skips_untracked_follows(home, fake):
+    fake.following_list = [_user("manual"), _user("JohnDoe")]
+    ctx = make_ctx(fake)
+    with ctx.store.tx() as c:  # logged with user-supplied case 10 days ago
+        c.execute(
+            "INSERT INTO actions(account, action, target, ok, detail, at) VALUES (?,?,?,?,?,?)",
+            ("test", "follow", "JOHNDOE", 1, "", iso(datetime.now(UTC) - timedelta(days=10))),
+        )
+    rule = {
+        "name": "prune",
+        "trigger": {"type": "unfollow_nonfollowers", "min_days_followed": 7},
+    }
+    make_engine([rule], ctx).run_once(force=True)
+    # 'manual' has no follow record, so it may have been followed minutes ago: kept.
+    assert fake.calls == [("unfollow", "JohnDoe")]
+
+
+def test_dry_run_reports_unsupported_actions(home, fake):
+    class NoDm(FakeBackend):
+        send_dm = Backend.send_dm  # type: ignore[assignment]
+
+    nodm = NoDm()
+    nodm.follower_list = [_user("old")]
+    rule = {"name": "welcome", "trigger": "welcome_dm", "action": {"message": "Hi"}}
+    run([rule], nodm)
+    nodm.follower_list = [_user("new"), _user("old")]
+    [res] = run([rule], nodm, dry_run=True)
+    assert res.status == "unsupported"
+
+
+def test_cli_run_nothing_due_prints_json(home, fake, tmp_path):
+    rules_file = tmp_path / "rules.yaml"
+    rules_file.write_text(yaml.safe_dump([COMMENT_RULE]), encoding="utf-8")
+    ctx = make_ctx(fake)
+    make_engine([COMMENT_RULE], ctx).run_once()  # now it's not due
+    ctx.json_output = True
+    res = CliRunner().invoke(automate_app, ["run", str(rules_file)], obj=ctx)
+    assert res.exit_code == 0, res.output
+    assert res.stdout.strip() == "[]"

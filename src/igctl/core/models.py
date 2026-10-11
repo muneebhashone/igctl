@@ -75,8 +75,11 @@ class DirectThread(BaseModel):
     title: str | None = None
     users: list[UserSummary] = Field(default_factory=list)
     last_message: str | None = None
+    last_message_id: str | None = None
+    last_sender_id: str | None = None
+    last_from_me: bool | None = None  # None when the backend can't tell
     last_activity_at: datetime | None = None
-    unread: bool = False
+    unread: bool = False  # newest message is from someone else and not seen by me
 
 
 class DirectMessage(BaseModel):

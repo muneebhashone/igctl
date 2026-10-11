@@ -72,7 +72,7 @@ GRAPH_METHODS = {
 PRIVATE_METHODS = {
     name
     for name, fn in vars(Backend).items()
-    if callable(fn) and not name.startswith("_") and name != "hide_comment"
+    if callable(fn) and not name.startswith("_") and name not in ("hide_comment", "supports")
 }
 
 

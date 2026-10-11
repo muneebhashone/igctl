@@ -5,11 +5,19 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import typer
 import yaml
 from PIL import Image
 from typer.testing import CliRunner
 
-from igctl.backends.base import AuthError, Backend, RateLimited
+from igctl.backends.base import (
+    ActionBlocked,
+    AuthError,
+    Backend,
+    IgctlError,
+    RateLimited,
+    TransientError,
+)
 from igctl.core.config import Account, Config, Limits
 from igctl.core.models import Media, MediaType, Profile, PublishRequest, PublishResult
 from igctl.core.ratelimit import Guard
@@ -32,7 +40,11 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("IGCTL_ACCOUNT", raising=False)
     Config(
         default_account="brand",
-        accounts={"brand": Account(name="brand"), "alt": Account(name="alt")},
+        accounts={
+            "brand": Account(name="brand", backend="private"),
+            "alt": Account(name="alt", backend="private"),
+            "gr": Account(name="gr"),  # graph, no media_host configured
+        },
     ).save()
     return h
 
@@ -235,18 +247,28 @@ def test_recover_stale(store, media) -> None:
     old = _enqueue(store, media, NOW - timedelta(hours=5))
     fresh = _enqueue(store, media, NOW - timedelta(hours=5))
     exhausted = _enqueue(store, media, NOW - timedelta(hours=5))
-    for pid in (old, fresh, exhausted):
-        assert store.claim_post(pid)
-    queue.record_claim(store, old, NOW - timedelta(hours=2))
-    queue.record_claim(store, fresh, NOW - timedelta(minutes=10))
+    assert store.claim_post(old, NOW - timedelta(hours=2))
+    assert store.claim_post(fresh, NOW - timedelta(minutes=10))
+    assert store.claim_post(exhausted, NOW - timedelta(minutes=10))
     store._conn.execute("UPDATE scheduled_posts SET attempts=3 WHERE id=?", (exhausted,))
-    store._conn.commit()  # exhausted has no claim row: falls back to run_at
+    # A running row without a claim predates atomic claims: stale by definition.
+    store._conn.execute("DELETE FROM scheduler_claims WHERE post_id=?", (exhausted,))
+    store._conn.commit()
 
     assert sorted(queue.recover_stale(store, now=NOW)) == sorted([old, exhausted])
     assert queue.get(store, old)["status"] == "pending"
     assert "stale" in queue.get(store, old)["error"]
     assert queue.get(store, fresh)["status"] == "running"
     assert queue.get(store, exhausted)["status"] == "failed"
+
+
+def test_claim_records_time_atomically(store, media) -> None:
+    # An overdue post (run_at hours ago) that was just claimed must not look stale to a
+    # concurrent runner: the claim time is written in the same transaction.
+    pid = _enqueue(store, media, NOW - timedelta(hours=5))
+    assert store.claim_post(pid, NOW)
+    assert queue.recover_stale(store, now=NOW) == []
+    assert queue.get(store, pid)["status"] == "running"
 
 
 # --- calendar import --------------------------------------------------------
@@ -312,6 +334,14 @@ def test_import_validates_all_rows_before_inserting(store, media) -> None:
     assert "File not found" in errs[1] and "unknown account 'ghost'" in errs[2]
     assert "media file is required" in errs[3]
     assert queue.list_posts(store) == []
+
+
+def test_import_reports_bad_offset_as_row_error(store, media) -> None:
+    cal = media["a.jpg"].parent / "tz.csv"
+    cal.write_text("when,files,tz\n2026-11-01T10:00,a.jpg,+25\n", encoding="utf-8")
+    with pytest.raises(CalendarError) as exc:  # not a raw ValueError traceback
+        queue.import_calendar(store, cal, default_account="brand")
+    assert exc.value.errors[0].startswith("row 1") and "offset" in exc.value.errors[0]
 
 
 def test_import_rejects_unknown_format(store, tmp_path) -> None:
@@ -397,7 +427,7 @@ def test_run_due_dry_run_touches_nothing(store, media) -> None:
 
 def test_run_due_skips_posts_claimed_elsewhere(store, media, monkeypatch) -> None:
     pid = _enqueue(store, media, NOW)
-    monkeypatch.setattr(store, "claim_post", lambda post_id: False)
+    monkeypatch.setattr(store, "claim_post", lambda post_id, at=None: False)
     assert run_due(store, factory(store, FakeBackend()), now=NOW)[0].status == "skipped"
     assert queue.get(store, pid)["status"] == "pending"
 
@@ -416,6 +446,23 @@ def test_is_transient_and_backoff() -> None:
 
     assert is_transient(RateLimited("x")) and is_transient(PleaseWaitFewMinutes())
     assert not is_transient(AuthError("x")) and not is_transient(ValueError("x"))
+    # Backends wrap network errors; the wrapper or its __cause__ marks them transient.
+    assert is_transient(TransientError("network"))
+
+    class ClientConnectionError(Exception):
+        pass
+
+    wrapped = IgctlError("Network error")
+    wrapped.__cause__ = ClientConnectionError()
+    assert is_transient(wrapped)
+    # An action block must not be retried within minutes.
+    blocked = ActionBlocked("feedback_required")
+
+    class SentryBlock(Exception):
+        pass
+
+    blocked.__cause__ = SentryBlock()
+    assert not is_transient(blocked)
     assert [backoff_delay(n).total_seconds() / 60 for n in (1, 2, 3)] == [5, 10, 20]
 
 
@@ -486,6 +533,60 @@ def test_cli_add_caption_file_account_and_errors(cli, media, tmp_path) -> None:
 
     with pytest.raises(ScheduleError, match="File not found"):
         cli("add", "nope.jpg", "--at", "now")
+
+
+def test_cli_rejects_graph_local_files_without_media_host(cli, media) -> None:
+    # The post could never be published; fail now, not hours later at publish time.
+    with pytest.raises(IgctlError, match="media_host"):
+        cli("add", str(media["a.jpg"]), "--at", "+1h", "--account", "gr")
+    cal = media["a.jpg"].parent / "gcal.csv"
+    cal.write_text("when,files,account\n+1d,a.jpg,gr\n", encoding="utf-8")
+    with pytest.raises(queue.CalendarError, match="media_host"):
+        cli("import", str(cal))
+    # Public URLs are fine.
+    assert cli("add", "https://x/a.jpg", "--at", "+1h", "--account", "gr").exit_code == 0
+
+
+def test_cli_list_respects_global_account(cli, media) -> None:
+    cli("add", str(media["a.jpg"]), "--at", "+1h", "--account", "alt")
+    cli("add", str(media["a.jpg"]), "--at", "+1h", "--account", "brand")
+    from igctl.cli._common import get_ctx  # noqa: F401 - root ctx is built by get_ctx
+    from igctl.core.context import Context
+
+    runner = CliRunner()
+    root = typer.Typer()
+
+    @root.callback()
+    def cb(ctx: typer.Context) -> None:
+        ctx.obj = Context(account_name="alt", json_output=True)
+
+    root.add_typer(cli.module.app, name="schedule")
+    res = runner.invoke(root, ["schedule", "list"], catch_exceptions=False)
+    assert {r["account"] for r in json.loads(res.stdout)} == {"alt"}
+
+
+def test_cli_add_json_and_tag_flag(cli, media) -> None:
+    from igctl.core.context import Context
+
+    runner = CliRunner()
+    root = typer.Typer()
+
+    @root.callback()
+    def cb(ctx: typer.Context) -> None:
+        ctx.obj = Context(json_output=True)
+
+    root.add_typer(cli.module.app, name="schedule")
+    res = runner.invoke(
+        root,
+        ["schedule", "add", str(media["a.jpg"]), "--at", "+1h", "-t", "friend", "-c", "x [/] y"],
+        catch_exceptions=False,
+    )
+    assert res.exit_code == 0, res.output
+    row = json.loads(res.stdout)
+    assert row["request"]["user_tags"] == ["friend"]  # -t is --tag, as in `post`
+    assert datetime.fromisoformat(row["run_at"]).tzinfo is not None  # ISO, not display text
+    # Captions with Rich markup characters must not break table output.
+    assert "x [/] y" in cli("list").output
 
 
 def test_cli_import(cli, media) -> None:

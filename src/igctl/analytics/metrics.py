@@ -76,6 +76,8 @@ def resolve_tz(name: str | None) -> tzinfo:
         return UTC
     if match := _OFFSET_RE.match(name.strip()):
         sign, hours, minutes = match.groups()
+        if int(hours) > 23 or int(minutes or 0) > 59:
+            raise IgctlError(f"Invalid UTC offset '{name}' (hours 0-23, minutes 0-59).")
         delta = timedelta(hours=int(hours), minutes=int(minutes or 0))
         return timezone(-delta if sign == "-" else delta, name)
     try:
@@ -119,15 +121,19 @@ def averages(media: Sequence[Media]) -> dict[str, float | None]:
 def posts_per_week(media: Sequence[Media], now: datetime | None = None) -> float | None:
     """Posting frequency over the span covered by ``media``.
 
-    The span runs from the oldest post to ``now`` (default: the newest post), so a long
-    silence since the last post lowers the rate. Needs at least two dated posts.
+    N posts span N-1 intervals, so the rate is (N-1) / span: two posts a week apart are one
+    post per week. The span runs from the oldest post to ``now`` (default: the newest post),
+    so a long silence since the last post lowers the rate. Needs at least two dated posts
+    and a non-zero span.
     """
     dates = sorted(as_tz(m.taken_at, UTC) for m in media if m.taken_at)
     if len(dates) < 2:
         return None
-    end = as_tz(now, UTC) if now else dates[-1]
-    days = max((end - dates[0]).total_seconds() / 86400, 1.0)
-    return len(dates) / days * 7
+    end = max(as_tz(now, UTC), dates[-1]) if now else dates[-1]
+    days = (end - dates[0]).total_seconds() / 86400
+    if days <= 0:
+        return None
+    return (len(dates) - 1) / days * 7
 
 
 def _group_stats(

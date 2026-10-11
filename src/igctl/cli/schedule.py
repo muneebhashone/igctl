@@ -9,10 +9,12 @@ from typing import Annotated, Any
 import typer
 from rich.markup import escape
 
-from igctl.backends.base import IgctlError
-from igctl.cli._common import emit, err_console, get_ctx, ok, warn
+from igctl.backends.base import Backend, IgctlError
+from igctl.cli._common import emit, emit_ok, err_console, get_ctx, ok, warn
 from igctl.core.context import Context
-from igctl.core.models import MediaType
+from igctl.core.files import read_text_file
+from igctl.core.media_host import check_graph_hostable
+from igctl.core.models import MediaType, PublishRequest
 from igctl.scheduler import queue
 from igctl.scheduler.runner import (
     STALE_AFTER,
@@ -79,6 +81,47 @@ def _account_name(ctx: Context, account: str | None) -> str:
     return ctx.config.account(account or ctx.account_name).name
 
 
+def check_hostable(
+    ctx: Context, account: str, req: PublishRequest, backend: Backend | None = None
+) -> None:
+    """Reject posts the account's backend could never publish (Graph + local files and no
+    ``media_host``) now, instead of failing at publish time, maybe hours later.
+
+    ``backend`` is the instance about to publish; otherwise the account's configured one.
+    """
+    acct = ctx.config.account(account)
+    name = backend.name if backend is not None else (ctx.backend_override or acct.backend)
+    if name == "graph":
+        check_graph_hostable(req, acct.graph_host, ctx.config)
+
+
+def queue_post(
+    ctx: Context, account: str, req: PublishRequest, when: str, tz: str | None = None
+) -> int | None:
+    """Validate, enqueue and report one post; shared by `schedule add` and `post --at`.
+
+    ``--json`` prints the stored row (:func:`queue.post_view`, ISO-8601 UTC times).
+    Returns the post id (None in dry-run).
+    """
+    check_hostable(ctx, account, req)
+    run_at = _parse_when(when, tz)
+    if ctx.dry_run:
+        ok(
+            f"[dry-run] would schedule a {req.media_type.value} for {account} "
+            f"at {format_local(run_at, tz)}"
+        )
+        emit_ok(ctx, dry_run=True, account=account, run_at=run_at.isoformat())
+        return None
+    post_id = queue.enqueue(ctx.store, account, req, run_at)
+    row = queue.get(ctx.store, post_id)
+    if ctx.json_output:
+        emit(ctx, queue.post_view(row))
+    else:
+        emit(ctx, _row_summary(row, tz), title="Scheduled post")
+    ok(f"Scheduled #{post_id} for {format_local(run_at, tz)} (account {account!r}).")
+    return post_id
+
+
 @app.command("add")
 def add(
     ctx: typer.Context,
@@ -86,7 +129,7 @@ def add(
     at: Annotated[str, typer.Option("--at", help=WHEN_HELP)],
     media_type: Annotated[
         MediaType | None,
-        typer.Option("--type", "-t", help="Default: carousel for 2+ files, reel for video."),
+        typer.Option("--type", help="Default: carousel for 2+ files, reel for video."),
     ] = None,
     caption: Annotated[str, typer.Option("--caption", "-c", help="Post caption.")] = "",
     caption_file: Annotated[
@@ -96,7 +139,9 @@ def add(
     account: Annotated[str | None, typer.Option("--account", "-a", help="Account alias.")] = None,
     cover: Annotated[Path | None, typer.Option("--cover", help="Reel/video cover image.")] = None,
     location: Annotated[str | None, typer.Option("--location", help="Location name.")] = None,
-    tag: Annotated[list[str] | None, typer.Option("--tag", help="Tag a user (repeatable).")] = None,
+    tag: Annotated[
+        list[str] | None, typer.Option("--tag", "-t", help="Tag a user (repeatable).")
+    ] = None,
     no_feed: Annotated[
         bool, typer.Option("--no-feed", help="Reels: don't also share to the feed.")
     ] = False,
@@ -106,7 +151,7 @@ def add(
     if caption_file:
         if caption:
             raise IgctlError("Use --caption or --caption-file, not both.")
-        caption = caption_file.read_text(encoding="utf-8").strip()
+        caption = read_text_file(caption_file, "caption file").strip()
     name = _account_name(c, account)
     warnings: list[str] = []
     req = queue.build_request(
@@ -121,16 +166,7 @@ def add(
     )
     for w in warnings:
         warn(w)
-    run_at = _parse_when(at, tz)
-    if c.dry_run:
-        ok(
-            f"[dry-run] would schedule a {req.media_type.value} for {name} "
-            f"at {format_local(run_at, tz)}"
-        )
-        return
-    post_id = queue.enqueue(c.store, name, req, run_at)
-    emit(c, _row_summary(queue.get(c.store, post_id), tz), title="Scheduled post")
-    ok(f"Scheduled #{post_id} for {format_local(run_at, tz)}.")
+    queue_post(c, name, req, at, tz)
 
 
 @app.command("import")
@@ -158,6 +194,7 @@ def import_(
         tz=tz,
         known_accounts=c.config.accounts.keys(),
         dry_run=c.dry_run,
+        check=lambda acct, req: check_hostable(c, acct, req),
     )
     rows = [
         {
@@ -190,7 +227,7 @@ def list_(
 ) -> None:
     """List scheduled posts (soonest first)."""
     c = get_ctx(ctx)
-    rows = queue.list_posts(c.store, status, account)
+    rows = queue.list_posts(c.store, status, account or c.account_name)
     if c.json_output:
         emit(c, [queue.post_view(r) for r in rows])
         return
@@ -230,9 +267,11 @@ def cancel(
     if c.dry_run:
         queue.get(c.store, post_id)
         ok(f"[dry-run] would cancel #{post_id}.")
+        emit_ok(c, id=post_id, status="cancelled", dry_run=True)
         return
     queue.cancel(c.store, post_id)
     ok(f"Cancelled #{post_id}.")
+    emit_ok(c, id=post_id, status="cancelled")
 
 
 @app.command("retry")
@@ -248,9 +287,11 @@ def retry(
     if c.dry_run:
         queue.get(c.store, post_id)
         ok(f"[dry-run] would retry #{post_id} at {format_local(run_at, tz)}.")
+        emit_ok(c, id=post_id, status="pending", run_at=run_at.isoformat(), dry_run=True)
         return
     queue.retry(c.store, post_id, run_at)
     ok(f"Re-queued #{post_id} for {format_local(run_at, tz)}.")
+    emit_ok(c, id=post_id, status="pending", run_at=run_at.isoformat())
 
 
 def _context_factory(root: Context):

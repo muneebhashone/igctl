@@ -10,12 +10,18 @@ from datetime import datetime, timedelta
 from igctl.automation.registry import Handler, RuleRun, get_handler
 from igctl.automation.rules import Rule, RuleSet, next_run
 from igctl.automation.state import RuleState
-from igctl.backends.base import IgctlError, NotSupported, RateLimited
+from igctl.backends.base import ActionBlocked, AuthError, IgctlError, NotSupported, RateLimited
 from igctl.core.context import Context
 from igctl.core.ratelimit import Guard
 from igctl.core.storage import utcnow
 
 ContextFactory = Callable[[str | None], Context]
+
+#: How long automation stops for an account after Instagram blocks an action, and after an
+#: authentication failure (expired session, challenge): retrying sooner is what escalates
+#: blocks to checkpoints or suspensions.
+BLOCK_COOLDOWN = timedelta(hours=24)
+AUTH_COOLDOWN = timedelta(hours=1)
 
 
 @dataclass
@@ -23,7 +29,7 @@ class RuleResult:
     rule: str
     account: str
     trigger: str
-    status: str  # ok | dry-run | capped | unsupported | error
+    status: str  # ok | dry-run | capped | unsupported | blocked | halted | error
     scanned: int = 0
     matched: int = 0
     acted: int = 0
@@ -55,6 +61,8 @@ class Engine:
         self._states: dict[str, RuleState] = {}
         # In-memory last runs, so dry-run loops still respect schedules.
         self._ran: dict[tuple[str, str], datetime] = {}
+        # In-memory account halts (dry-run never persists them).
+        self._halts: dict[str, tuple[datetime, str]] = {}
 
     # --- plumbing ------------------------------------------------------------
     def context(self, rule: Rule) -> Context:
@@ -80,6 +88,19 @@ class Engine:
         return self._guards[name]
 
     # --- scheduling ----------------------------------------------------------
+    def _halted(self, ctx: Context, account: str) -> tuple[datetime, str] | None:
+        now = self._clock()
+        mem = self._halts.get(account)
+        if mem and mem[0] > now:
+            return mem
+        return None if ctx.dry_run else self._state(ctx).halted(account, now)
+
+    def _halt(self, ctx: Context, account: str, cooldown: timedelta, reason: str) -> None:
+        until = self._clock() + cooldown
+        self._halts[account] = (until, reason)
+        if not ctx.dry_run:
+            self._state(ctx).halt(account, until, reason)
+
     def selected(self, only: str | None = None) -> list[Rule]:
         if only:
             return [self.ruleset.get(only)]
@@ -123,6 +144,11 @@ class Engine:
         except Exception as e:  # noqa: BLE001 - bad account/backend: report, don't crash
             result.status, result.message = "error", str(e) or type(e).__name__
             return result
+        if halt := self._halted(ctx, result.account):
+            until, reason = halt
+            result.status = "halted"
+            result.message = f"account paused until {until.isoformat(timespec='minutes')}: {reason}"
+            return result
 
         guard = run.guard
         base_limits = guard.limits
@@ -140,6 +166,13 @@ class Engine:
             result.status, result.message = "capped", str(e)
         except NotSupported as e:
             result.status, result.message = "unsupported", str(e)
+        except ActionBlocked as e:
+            # Stop every rule of this account, not just this one, for a long cooldown.
+            result.status, result.message = "blocked", str(e)
+            self._halt(ctx, result.account, BLOCK_COOLDOWN, str(e))
+        except AuthError as e:
+            result.status, result.message = "error", f"{type(e).__name__}: {e}"
+            self._halt(ctx, result.account, AUTH_COOLDOWN, str(e))
         except Exception as e:  # noqa: BLE001 - one broken rule must not kill the loop
             result.status, result.message = "error", f"{type(e).__name__}: {e}"
         finally:

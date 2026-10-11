@@ -6,10 +6,11 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 from instagrapi import exceptions as ig
 from instagrapi import types as igt
 
-from igctl.backends.base import AuthError, IgctlError, RateLimited
+from igctl.backends.base import ActionBlocked, AuthError, IgctlError, RateLimited, TransientError
 from igctl.backends.private import (
     PrivateBackend,
     flatten_insights,
@@ -132,11 +133,24 @@ def test_to_comment_and_thread():
     thread = MagicMock(spec=igt.DirectThread)
     thread.id, thread.thread_title, thread.last_activity_at = "77", "Chat", NOW
     thread.users = [short("5", "bob")]
-    thread.messages = [MagicMock(text="hey", item_type="text")]
-    thread.is_seen.return_value = False
+    thread.last_seen_at = {}
+    thread.messages = [
+        igt.DirectMessage(id="m9", user_id="5", timestamp=NOW, text="hey", item_type="text")
+    ]
     t = to_thread(thread, "42")
     assert t.id == "77" and t.unread and t.last_message == "hey"
     assert t.users[0].username == "bob"
+    assert (t.last_message_id, t.last_sender_id, t.last_from_me) == ("m9", "5", False)
+
+    # Our own last message: never unread, and flagged so dm_autoreply skips it.
+    thread.messages = [igt.DirectMessage(id="m10", user_id="42", timestamp=NOW, text="ok")]
+    t = to_thread(thread, "42")
+    assert t.last_from_me is True and not t.unread
+
+    # Seen after the newest message: read.
+    thread.messages = [igt.DirectMessage(id="m11", user_id="5", timestamp=NOW, text="yo")]
+    thread.last_seen_at = {"42": MagicMock(timestamp=NOW.replace(hour=5))}
+    assert not to_thread(thread, "42").unread
 
 
 def test_flatten_insights():
@@ -246,6 +260,28 @@ def test_publish_story_dispatches_by_extension(backend, client, files):
     assert res.permalink == "https://www.instagram.com/stories/acme/333/"
 
 
+def test_story_stickers_have_geometry(backend, client, files):
+    story = MagicMock(id="1_2", pk="1", code="c", taken_at=NOW, video_url=None, hashtags=[])
+    story.thumbnail_url, story.user.username = None, "acme"
+    client.photo_upload_to_story.return_value = story
+    client.user_info_by_username_v1.side_effect = lambda n: ig_user("9", n)
+    client.fbsearch_places.return_value = [igt.Location(pk=1, name="Paris")]
+    backend.publish(
+        PublishRequest(
+            media_type=MediaType.STORY,
+            paths=[files["a.jpg"]],
+            user_tags=["bob", "carol:0.2,0.7"],
+            location="Paris",
+        )
+    )
+    kwargs = client.photo_upload_to_story.call_args.kwargs
+    first, second = kwargs["mentions"]
+    for sticker in (first, second, kwargs["locations"][0]):
+        assert None not in (sticker.x, sticker.y, sticker.width, sticker.height)
+    assert (second.x, second.y) == (0.2, 0.7)
+    assert first.y != kwargs["locations"][0].y
+
+
 def test_publish_missing_file(backend):
     with pytest.raises(IgctlError, match="not found"):
         backend.publish(PublishRequest(media_type=MediaType.IMAGE, paths=[Path("nope.jpg")]))
@@ -287,8 +323,15 @@ def test_following_resolves_username(backend, client):
         (ig.BadPassword(), AuthError),
         (ig.PleaseWaitFewMinutes(), RateLimited),
         (ig.RateLimitError(), RateLimited),
-        (ig.FeedbackRequired(), RateLimited),
+        (ig.FeedbackRequired(), ActionBlocked),
+        (ig.SentryBlock(), ActionBlocked),
         (ig.ClientThrottledError(), RateLimited),
+        (ig.ClientConnectionError(), TransientError),
+        (ig.ClientRequestTimeout(), TransientError),
+        (ig.ClientIncompleteReadError(), TransientError),
+        (requests.ConnectionError("reset"), TransientError),
+        (AssertionError("Login required"), AuthError),
+        (KeyError("users"), IgctlError),
         (ig.UserNotFound(), IgctlError),
         (ig.ClientError("boom"), IgctlError),
     ],
@@ -301,9 +344,17 @@ def test_map_error(exc, expected):
 
 def test_methods_translate_errors(backend, client):
     client.media_like.side_effect = ig.FeedbackRequired(message="feedback_required")
-    with pytest.raises(RateLimited) as info:
+    with pytest.raises(ActionBlocked) as info:
         backend.like("111_1")
     assert isinstance(info.value.__cause__, ig.FeedbackRequired)
+
+    # Non-ClientError exceptions from instagrapi are translated too (no raw tracebacks).
+    client.media_like.side_effect = AssertionError("Login required")
+    with pytest.raises(AuthError):
+        backend.like("111_1")
+    client.media_comments.side_effect = KeyError("comments")
+    with pytest.raises(IgctlError, match="unexpected response"):
+        backend.list_comments("111_1")
 
     client.user_followers_v1_chunk.side_effect = ig.LoginRequired()
     with pytest.raises(AuthError):
@@ -335,12 +386,53 @@ def test_engagement_and_dm(backend, client):
 
 
 def test_media_ref_resolution(backend, client):
+    from igctl.core.refs import shortcode_to_pk
+
+    pk = str(shortcode_to_pk("ABCdef"))
+    for url in (
+        "https://www.instagram.com/p/ABCdef/",
+        "https://www.instagram.com/p/ABCdef/embed/",
+        "https://www.instagram.com/p/ABCdef/c/17900000000000000/",
+        "https://www.instagram.com/someone/p/ABCdef/",
+        "https://www.instagram.com/reel/ABCdef/?igsh=x",
+    ):
+        backend.like(url)
+        client.media_like.assert_called_with(pk)
+    backend.like("https://www.instagram.com/stories/bob/3456789012345678901/")
+    client.media_like.assert_called_with("3456789012345678901")
+    client.media_pk_from_url.assert_not_called()  # parsed locally, no request
+    with pytest.raises(IgctlError, match="Not an Instagram post"):
+        backend.like("https://www.instagram.com/bob/")
     client.media_pk_from_url.return_value = "555"
-    backend.like("https://www.instagram.com/p/ABCdef/")
+    backend.like("https://www.instagram.com/share/p/Xyz/")  # short links need the redirect
     client.media_like.assert_called_with("555")
     client.media_pk_from_code.return_value = "556"
     backend.like("ABCdef")
     client.media_like.assert_called_with("556")
+
+
+def test_zero_limits_never_page_forever(backend, client):
+    client.hashtag_medias_top_v1.return_value = [ig_media()]
+    assert len(backend.hashtag_media("cats", limit=0)) == 1
+    assert client.hashtag_medias_top_v1.call_args.kwargs["amount"] > 0
+    client.search_users_v1.return_value = [short()]
+    assert len(backend.search_users("al", limit=0)) == 1
+    assert client.search_users_v1.call_args.args[1] > 0
+    thread = MagicMock(spec=igt.DirectThread)
+    thread.id, thread.thread_title, thread.last_activity_at = "1", "", NOW
+    thread.users, thread.messages, thread.last_seen_at = [], [], {}
+    client.direct_threads.return_value = [thread, thread]
+    assert len(backend.list_threads(limit=0)) == 2  # 0 = all, not []
+    client.direct_messages.return_value = [
+        igt.DirectMessage(id="m", user_id="5", timestamp=NOW, text="x")
+    ]
+    assert len(backend.thread_messages("1", limit=0)) == 1
+
+
+def test_writes_persist_rotated_session(backend, client, igctl_home):
+    backend._authenticated = True
+    backend.like("111_1")
+    client.dump_settings.assert_called_once_with(igctl_home / "sessions" / "acme.json")
 
 
 def test_download_dispatch(backend, client, tmp_path):
@@ -388,10 +480,30 @@ def test_login_relogs_preserving_uuids_on_expired_session(igctl_home):
     b = PrivateBackend(Account(name="acme", backend="private", username="acme"), client=c)
 
     b.login(password="pw", verification_code="123456")
-    c.set_settings.assert_called_once_with({})
-    c.set_uuids.assert_called_once_with({"uuid": "dev-1"})
-    c.login.assert_called_once_with("acme", "pw", verification_code="123456")
+    # instagrapi's relogin clears only auth state/cookies and keeps the loaded device.
+    c.set_settings.assert_not_called()
+    c.login.assert_called_once_with("acme", "pw", relogin=True, verification_code="123456")
     c.dump_settings.assert_called_once()
+
+
+def test_explicit_credentials_are_always_verified(igctl_home):
+    # `auth login` with a still-valid session of another user (or an old password) must not
+    # reuse it: the new credentials get a real login.
+    sess = igctl_home / "sessions"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "acme.json").write_text("{}")
+    c = _fresh_client()
+    c.user_info_v1.return_value = ig_user("43", "newuser")
+    b = PrivateBackend(Account(name="acme", backend="private", username="olduser"), client=c)
+
+    profile = b.login("newuser", "new-pw", verification_code="111111")
+    c.get_timeline_feed.assert_not_called()
+    c.login.assert_called_once_with("newuser", "new-pw", relogin=True, verification_code="111111")
+    assert profile.username == "newuser"
+
+    c.login.side_effect = ig.BadPassword()
+    with pytest.raises(AuthError):
+        b.login("newuser", "wrong")
 
 
 def test_login_without_session_or_password_fails():

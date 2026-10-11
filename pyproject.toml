@@ -30,6 +30,7 @@ dependencies = [
     "pydantic>=2.7",
     "pyyaml>=6.0",
     "instagrapi>=3.0.21",
+    "requests>=2.31",
     "pillow>=10.0",
     "keyring>=25.0",
     "croniter>=2.0",

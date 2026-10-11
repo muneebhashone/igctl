@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     summary TEXT,
     PRIMARY KEY (account, rule)
 );
+CREATE TABLE IF NOT EXISTS automation_halts (
+    account TEXT PRIMARY KEY,
+    until TEXT NOT NULL,           -- ISO-8601 UTC
+    reason TEXT NOT NULL
+);
 """
 
 
@@ -53,12 +58,36 @@ class RuleState:
                 (account, rule, iso(at), status, summary),
             )
 
+    def halt(self, account: str, until: datetime, reason: str) -> None:
+        """Stop automating ``account`` until ``until`` (auth failure, action block)."""
+        with self.store.tx() as c:
+            c.execute(
+                "INSERT INTO automation_halts(account, until, reason) VALUES (?,?,?) "
+                "ON CONFLICT(account) DO UPDATE SET until=excluded.until, reason=excluded.reason",
+                (account, iso(until), reason),
+            )
+
+    def halted(self, account: str, now: datetime) -> tuple[datetime, str] | None:
+        """``(until, reason)`` while ``account`` is halted, else None."""
+        with self.store.tx() as c:
+            row = c.execute(
+                "SELECT until, reason FROM automation_halts WHERE account=?", (account,)
+            ).fetchone()
+        if row is None:
+            return None
+        until = datetime.fromisoformat(row[0])
+        return (until, row[1]) if until > now else None
+
 
 def last_action_at(store: Store, account: str, action: str, target: str) -> datetime | None:
-    """When ``action`` last succeeded on ``target`` (e.g. when we followed a user)."""
+    """When ``action`` last succeeded on ``target`` (e.g. when we followed a user).
+
+    Usernames are case-insensitive on Instagram, so targets are compared that way.
+    """
     with store.tx() as c:
         row = c.execute(
-            "SELECT MAX(at) FROM actions WHERE account=? AND action=? AND target=? AND ok=1",
+            "SELECT MAX(at) FROM actions WHERE account=? AND action=? AND lower(target)=lower(?) "
+            "AND ok=1",
             (account, action, target),
         ).fetchone()
     return datetime.fromisoformat(row[0]) if row and row[0] else None

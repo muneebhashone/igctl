@@ -120,14 +120,25 @@ class DmAutoreply(Handler):
     def run(self, run: RuleRun) -> None:
         t: DmTrigger = run.trigger
         a: DmAction = run.action
+        my_id = None
         for thread in run.backend.list_threads(limit=t.threads, unread_only=t.unread_only):
             if run.budget == 0:
                 return
             run.stats.scanned += 1
+            # Never answer our own message (an outbound DM, a manual reply, or this rule's own
+            # previous auto-reply, which would otherwise loop on every run).
+            from_me = thread.last_from_me
+            if from_me is None and thread.last_sender_id:
+                my_id = my_id or run.me.id
+                from_me = thread.last_sender_id == my_id
+            if from_me:
+                continue
             if not run.filter.matches(thread.last_message):
                 continue
+            # Key on the incoming message itself; last_activity_at also moves on our replies.
             stamp = thread.last_activity_at.isoformat() if thread.last_activity_at else ""
-            key = thread.id if t.once_per_thread else f"{thread.id}@{stamp or thread.last_message}"
+            incoming = thread.last_message_id or stamp or thread.last_message
+            key = thread.id if t.once_per_thread else f"{thread.id}@{incoming}"
             if run.seen(key):
                 continue
             run.stats.matched += 1
@@ -151,12 +162,23 @@ class DmAutoreply(Handler):
 FOLLOWER_SNAPSHOT = "automation:followers"
 
 
+#: Failed welcome DMs are retried on later runs, then given up on.
+WELCOME_MAX_ATTEMPTS = 3
+
+
 class WelcomeTrigger(Params):
     scan_limit: int = Field(1000, ge=0, description="newest followers to fetch; 0 = all")
 
 
 class WelcomeAction(Params):
     message: str = Field(description="template: {username} {full_name}")
+
+
+def _pending_entry(raw: dict) -> tuple[UserSummary, int]:
+    """A stored pending item: ``{"user": ..., "attempts": n}`` (or a bare legacy user)."""
+    if "user" in raw:
+        return UserSummary.model_validate(raw["user"]), int(raw.get("attempts", 0))
+    return UserSummary.model_validate(raw), 0
 
 
 @register
@@ -174,49 +196,61 @@ class WelcomeDm(Handler):
         current = list(run.backend.followers(None, limit=t.scan_limit))
         current_ids = {u.id for u in current}
         snaps = run.store.snapshots(run.account, FOLLOWER_SNAPSHOT, subject, limit=1)
+        prev = snaps[0]["data"] if snaps else None
+        # Every follower id ever seen by this rule (not just the latest window), so older
+        # followers sliding into a truncated scan window are never mistaken for new ones.
+        known = set(prev.get("followers", [])) if prev else set()
 
-        def save(pending: Iterable[UserSummary]) -> None:
+        def save(pending: Iterable[tuple[UserSummary, int]]) -> None:
             if run.dry_run:
                 return
-            run.store.save_snapshot(
+            run.store.replace_snapshot(  # one row per rule, not a new one every run
                 run.account,
                 FOLLOWER_SNAPSHOT,
                 subject,
                 {
-                    "followers": [u.id for u in current],
-                    "pending": [u.model_dump(mode="json") for u in pending],
+                    "followers": sorted(known | current_ids),
+                    "pending": [
+                        {"user": u.model_dump(mode="json"), "attempts": n} for u, n in pending
+                    ],
                 },
             )
 
-        if not snaps:
+        if prev is None:
             save([])
             run.stats.note(f"baseline recorded ({len(current)} followers); new ones get DMs")
             return
 
-        prev = snaps[0]["data"]
-        prev_ids = set(prev.get("followers", []))
-        queue: dict[str, UserSummary] = {}
+        queue: dict[str, tuple[UserSummary, int]] = {}
         for raw in prev.get("pending", []):
-            u = UserSummary.model_validate(raw)
+            u, attempts = _pending_entry(raw)
             if u.id in current_ids:  # still following us
-                queue[u.id] = u
-        for u in current:
-            if u.id not in prev_ids:
-                queue.setdefault(u.id, u)
+                queue[u.id] = (u, attempts)
+        truncated = bool(t.scan_limit) and len(current) >= t.scan_limit
+        for u in current:  # newest first
+            if u.id in known:
+                if truncated:
+                    break  # the rest of a truncated window is older than a known follower
+                continue
+            queue.setdefault(u.id, (u, 0))
 
-        leftover: list[UserSummary] = []
-        for u in queue.values():
+        leftover: list[tuple[UserSummary, int]] = []
+        for u, attempts in queue.values():
             run.stats.scanned += 1
             if run.seen(u.id) or not run.filter.matches(_user_text(u)):
                 continue
             run.stats.matched += 1
             if run.budget == 0:
-                leftover.append(u)  # welcome on a later run
+                leftover.append((u, attempts))  # welcome on a later run
                 continue
             text = render(a.message, username=u.username, full_name=u.full_name or u.username)
             if run.act("dm", u.username, partial(run.backend.send_dm, [u.username], text)):
                 run.mark(u.id)
                 run.stats.acted += 1
+            elif attempts + 1 < WELCOME_MAX_ATTEMPTS:
+                leftover.append((u, attempts + 1))  # retry a failed DM later
+            else:
+                run.stats.note(f"gave up welcoming @{u.username} after {attempts + 1} attempts")
         if leftover:
             run.stats.note(f"{len(leftover)} new followers queued for the next run")
         save(leftover)
@@ -297,7 +331,10 @@ class HashtagEngage(Handler):
 class UnfollowTrigger(Params):
     whitelist: list[str] = Field(default_factory=list, description="never unfollow these")
     min_days_followed: float = Field(
-        0, ge=0, description="only unfollow if we followed them at least this long ago"
+        0,
+        ge=0,
+        description="only unfollow if igctl followed them at least this long ago "
+        "(when > 0, accounts with no igctl follow record are skipped)",
     )
     only_followed_by_igctl: bool = Field(
         False, description="skip accounts igctl has no record of following"
@@ -331,7 +368,9 @@ class UnfollowNonfollowers(Handler):
                 continue
             followed_at = last_action_at(run.store, run.account, "follow", u.username)
             if followed_at is None:
-                if t.only_followed_by_igctl:
+                # No record of when we followed them (manual or another tool): it may have
+                # been minutes ago, so min_days_followed can't be honoured.
+                if t.only_followed_by_igctl or t.min_days_followed:
                     continue
             elif t.min_days_followed and followed_at > cutoff:
                 continue

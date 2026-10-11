@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from igctl.backends.base import IgctlError
 from igctl.core.config import BackendName
+from igctl.core.files import read_text_file
 
 _INTERVAL_RE = re.compile(r"(\d+)\s*([smhd])")
 _UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
@@ -228,7 +229,7 @@ def load_rules(path: str | Path) -> RuleSet:
     if not p.is_file():
         raise RulesError(f"Rules file not found: {p}")
     try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+        data = yaml.safe_load(read_text_file(p, "rules file"))
     except yaml.YAMLError as e:
         raise RulesError(f"{p}: invalid YAML: {e}") from e
     ruleset = parse_rules(data if data is not None else [], source=str(p))

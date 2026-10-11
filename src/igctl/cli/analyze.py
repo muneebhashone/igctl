@@ -15,6 +15,7 @@ from igctl.analytics.export import export
 from igctl.analytics.metrics import resolve_tz
 from igctl.backends.base import NotSupported
 from igctl.cli._common import emit, get_ctx, ok, warn
+from igctl.cli.download import resolve_media_ref
 from igctl.core.context import Context
 
 app = typer.Typer(no_args_is_help=True, help="Profile, post, hashtag and follower analytics.")
@@ -62,9 +63,11 @@ def profile(
     """Engagement, best posting times, content mix, hashtags and growth for an account."""
     ic = get_ctx(ctx)
     zone = resolve_tz(tz)
+    # --dry-run changes nothing, including the stored growth baseline.
+    save = snapshot and not ic.dry_run
     with _supported():
         report = rp.build_profile_report(
-            ic.backend(), username, posts, zone, ic.store, ic.account.name, snapshot, top
+            ic.backend(), username, posts, zone, ic.store, ic.account.name, save, top
         )
     _save(report, out)
     if ic.json_output:
@@ -127,6 +130,9 @@ def followers(
         save = diff = True
     account = ic.account.name
     subject = username
+    if save and ic.dry_run:
+        warn("[dry-run] not saving a follower snapshot; diffing the stored ones.")
+        save = False
     if save:
         with _supported():
             counts = fl.take_snapshot(ic.backend(), ic.store, account, username, limit)
@@ -146,6 +152,12 @@ def followers(
         raise typer.Exit(1)
     if result.get("previous_at") is None:
         warn("Only one snapshot so far; new/lost followers appear after the next --save.")
+    if skipped := result.get("skipped"):
+        warn(
+            "Snapshots were cut by --limit, so these can't be computed reliably: "
+            + ", ".join(skipped)
+            + ". Snapshot without --limit for a full diff."
+        )
     _save(result, out)
     if ic.json_output:
         emit(ic, result)
@@ -168,7 +180,7 @@ def followers(
 @app.command()
 def post(
     ctx: typer.Context,
-    media_id: str = typer.Argument(..., help="Media id."),
+    media_id: str = typer.Argument(..., help="Media id, shortcode or URL."),
     metrics: str | None = typer.Option(None, "--metrics", help="Comma-separated insight metrics."),
     out: Path | None = OutOpt,
 ) -> None:
@@ -176,7 +188,9 @@ def post(
     ic = get_ctx(ctx)
     names = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else None
     with _supported():
-        report = rp.post_report(ic.backend(), media_id, names)
+        backend = ic.backend()
+        media_id = resolve_media_ref(backend, media_id)
+        report = rp.post_report(backend, media_id, names)
     _save(report, out)
     if ic.json_output:
         emit(ic, report)
@@ -223,10 +237,20 @@ def insights(
     ctx: typer.Context,
     days: int = typer.Option(30, "--days", "-d", min=1, help="Look-back window."),
     metrics: str = typer.Option(DEFAULT_INSIGHTS, "--metrics", help="Comma-separated metrics."),
-    period: str = typer.Option("day", "--period", help="day | week | days_28 | lifetime"),
+    period: str = typer.Option(
+        "day",
+        "--period",
+        help="Only 'day' (the Graph API's sole period for these metrics); --days sets the range.",
+    ),
     out: Path | None = OutOpt,
 ) -> None:
     """Account insights over a period (Graph API)."""
+    if period != "day":
+        raise typer.BadParameter(
+            "the Graph API only supports period 'day' for account metrics; use --days for "
+            "the range",
+            param_hint="--period",
+        )
     ic = get_ctx(ctx)
     names = [m.strip() for m in metrics.split(",") if m.strip()]
     with _supported():
@@ -263,5 +287,7 @@ def audience(
     _save(rows, out)
     if not rows:
         warn("No demographic data (Instagram requires 100+ followers).")
+        if ic.json_output:
+            emit(ic, [])
         return
     emit(ic, rows, ["dimension", "key", "value"], title="Audience")

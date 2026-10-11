@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE INDEX IF NOT EXISTS ix_snap ON snapshots(account, kind, subject, at);
 
+CREATE TABLE IF NOT EXISTS scheduler_claims (
+    post_id INTEGER PRIMARY KEY,
+    claimed_at TEXT NOT NULL       -- ISO-8601 UTC, written in the same tx as the claim
+);
+
 CREATE TABLE IF NOT EXISTS seen (
     account TEXT NOT NULL,
     namespace TEXT NOT NULL,       -- e.g. 'autoreply:comment', 'welcome:follower'
@@ -124,15 +129,25 @@ class Store:
             )
         )
 
-    def claim_post(self, post_id: int) -> bool:
-        """Atomically move a pending post to running. False if someone else took it."""
+    def claim_post(self, post_id: int, at: datetime | None = None) -> bool:
+        """Atomically move a pending post to running. False if someone else took it.
+
+        The claim time is recorded in the same transaction, so stale-claim recovery never
+        sees a running post without a fresh claim time.
+        """
         with self.tx() as c:
             cur = c.execute(
                 "UPDATE scheduled_posts SET status='running', attempts=attempts+1 "
                 "WHERE id=? AND status='pending'",
                 (post_id,),
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return False
+            c.execute(
+                "INSERT OR REPLACE INTO scheduler_claims(post_id, claimed_at) VALUES (?, ?)",
+                (post_id, iso(at)),
+            )
+            return True
 
     def finish_post(
         self, post_id: int, status: str, result: str | None = None, error: str | None = None
@@ -155,6 +170,22 @@ class Store:
     # --- snapshots -----------------------------------------------------------
     def save_snapshot(self, account: str, kind: str, subject: str, data: object) -> int:
         with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO snapshots(account, kind, subject, data, at) VALUES (?,?,?,?,?)",
+                (account, kind, subject, json.dumps(data, default=str), iso()),
+            )
+            return int(cur.lastrowid)
+
+    def replace_snapshot(self, account: str, kind: str, subject: str, data: object) -> int:
+        """Like :meth:`save_snapshot`, but keep only this row for (account, kind, subject).
+
+        For state overwritten on every run (automation bookkeeping), not history.
+        """
+        with self.tx() as c:
+            c.execute(
+                "DELETE FROM snapshots WHERE account=? AND kind=? AND subject=?",
+                (account, kind, subject),
+            )
             cur = c.execute(
                 "INSERT INTO snapshots(account, kind, subject, data, at) VALUES (?,?,?,?,?)",
                 (account, kind, subject, json.dumps(data, default=str), iso()),

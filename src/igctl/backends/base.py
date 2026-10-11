@@ -48,8 +48,28 @@ class RateLimited(IgctlError):
     pass
 
 
+class TransientError(IgctlError):
+    """A failure worth retrying soon: network errors, timeouts, temporary 5xx responses."""
+
+
+class ActionBlocked(IgctlError):
+    """Instagram blocked an action (feedback_required, sentry block).
+
+    Not transient: retrying within minutes during an active block is what escalates it to a
+    checkpoint or suspension. Automation must stop for the account (24h+).
+    """
+
+
 class Backend(ABC):
     name: str
+
+    def supports(self, op: str) -> bool:
+        """Whether this backend implements ``op`` (a :class:`Backend` method name).
+
+        Lets ``--dry-run`` report unsupported actions instead of pretending they worked.
+        """
+        impl = getattr(type(self), op, None)
+        return impl is not None and impl is not getattr(Backend, op, None)
 
     # --- session -------------------------------------------------------------
     @abstractmethod

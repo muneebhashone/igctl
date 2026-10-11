@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -24,9 +25,25 @@ from typing import Any
 
 import httpx
 
-from igctl.backends.base import AuthError, Backend, IgctlError, NotSupported, RateLimited
+from igctl.backends.base import (
+    AuthError,
+    Backend,
+    IgctlError,
+    NotSupported,
+    RateLimited,
+    TransientError,
+)
 from igctl.core.config import Account, Config, get_secret, secret_env_var
-from igctl.core.media_host import is_video, resolve_urls, upload_file
+from igctl.core.media_host import (
+    IMAGE_SUFFIXES,
+    JPEG_SUFFIXES,
+    VIDEO_SUFFIXES,
+    graph_direct_upload,
+    is_video,
+    to_jpeg,
+    upload_file,
+    url_suffix,
+)
 from igctl.core.models import (
     Comment,
     Insight,
@@ -57,13 +74,21 @@ HASHTAG_MEDIA_FIELDS = (
 
 MAX_CAROUSEL_ITEMS = 10
 MAX_INSIGHT_WINDOW = timedelta(days=30)
-# Account metrics that only exist as daily time series (no total_value form).
+# Account metrics that only exist as time series (no total_value form). follower_count is a
+# daily series; online_followers only accepts period=lifetime (hourly values per day).
 TIME_SERIES_METRICS = frozenset({"follower_count", "online_followers"})
+LIFETIME_SERIES_METRICS = frozenset({"online_followers"})
+# Since v20 the interaction metrics (total_value) and follower_count only accept period=day;
+# the since/until window sets the range.
+ACCOUNT_PERIOD = "day"
 DEMOGRAPHIC_BREAKDOWNS = ("age", "gender", "country", "city")
 
 FEED_METRICS = ["reach", "views", "likes", "comments", "shares", "saved", "total_interactions"]
 REEL_METRICS = [*FEED_METRICS, "ig_reels_avg_watch_time", "ig_reels_video_view_total_time"]
 STORY_METRICS = ["reach", "views", "replies", "shares", "total_interactions"]
+# Valid for every media product type (feed, reel, story); the fallback on the Instagram-Login
+# host, where media_product_type is unavailable and stories/reels can't be told apart.
+COMMON_METRICS = ["reach", "views", "shares", "total_interactions"]
 
 _HASHTAG_RE = re.compile(r"#(\w+)", re.UNICODE)
 
@@ -126,18 +151,26 @@ class GraphBackend(Backend):
             data = self._get("me", {"fields": "user_id,username"})
             self._username = self._username or data.get("username")
             return str(data.get("user_id") or data["id"])
-        # Facebook Login: the IG account hangs off one of the user's Pages.
-        pages = self._get("me/accounts", {"fields": "name,instagram_business_account{id,username}"})
+        # Facebook Login: the IG account hangs off one of the user's Pages (any page of them).
+        pages = self._paginate(
+            "me/accounts", {"fields": "name,instagram_business_account{id,username}"}, 0
+        )
         found = [
-            p["instagram_business_account"]
-            for p in pages.get("data", [])
-            if p.get("instagram_business_account")
+            p["instagram_business_account"] for p in pages if p.get("instagram_business_account")
         ]
         wanted = (self.account.username or "").lower()
-        for ig in found:
-            if not wanted or ig.get("username", "").lower() == wanted:
-                self._username = self._username or ig.get("username")
-                return str(ig["id"])
+        if wanted:
+            found = [ig for ig in found if ig.get("username", "").lower() == wanted]
+        if len({str(ig["id"]) for ig in found}) > 1:
+            names = ", ".join(sorted(f"@{ig.get('username', ig['id'])}" for ig in found))
+            raise IgctlError(
+                f"This token manages several Instagram accounts ({names}). Set `username` or "
+                "`ig_user_id` for the account in config.yaml (or re-run `igctl auth login` "
+                "with --ig-user-id)."
+            )
+        if found:
+            self._username = self._username or found[0].get("username")
+            return str(found[0]["id"])
         raise IgctlError(
             "Could not find an Instagram Business/Creator account linked to this token's "
             "Facebook Pages. Set `ig_user_id` for the account in config.yaml."
@@ -174,7 +207,7 @@ class GraphBackend(Backend):
                 if attempt < 2:
                     self._sleep(2**attempt)
                     continue
-                raise IgctlError(
+                raise TransientError(
                     f"Network error talking to {self.account.graph_host}: {exc}"
                 ) from exc
             try:
@@ -194,6 +227,8 @@ class GraphBackend(Backend):
                 continue
             if resp.status_code == 429:
                 raise RateLimited("Instagram rate limit hit (HTTP 429). Try again later.")
+            if resp.status_code >= 500:
+                raise TransientError(f"Graph API HTTP {resp.status_code}: {resp.text[:300]}")
             raise IgctlError(f"Graph API HTTP {resp.status_code}: {resp.text[:300]}")
         raise AssertionError("unreachable")
 
@@ -250,27 +285,25 @@ class GraphBackend(Backend):
         return data[0]
 
     def publish(self, req: PublishRequest) -> PublishResult:
-        uploads: list[str | Path]
-        if req.urls:
-            uploads = list(req.urls)
-        elif self._use_resumable(req):
-            uploads = list(req.paths)
-        else:
-            uploads = list(resolve_urls(req, self.config).urls)
-        if not uploads:
+        with tempfile.TemporaryDirectory(prefix="igctl-jpeg-") as tmp:
+            sources = self._sources(req, Path(tmp))
+            cover_url = None
+            if req.cover and req.media_type is not MediaType.CAROUSEL:
+                cover_url = upload_file(to_jpeg(req.cover, Path(tmp)), self.config)
+        if not sources:
             raise IgctlError("Nothing to publish: no file paths or URLs given.")
 
         common = self._common_params(req)
         if req.media_type is MediaType.CAROUSEL:
-            if not 2 <= len(uploads) <= MAX_CAROUSEL_ITEMS:
+            if not 2 <= len(sources) <= MAX_CAROUSEL_ITEMS:
                 raise IgctlError(f"A carousel needs 2-{MAX_CAROUSEL_ITEMS} items.")
             children = [
-                self._create_container(src, {"is_carousel_item": "true"}, video=is_video(src))
-                for src in uploads
+                self._create_container(src, {"is_carousel_item": "true"}, video=video)
+                for src, video in sources
             ]
-            for child, src in zip(children, uploads, strict=True):
-                if is_video(src):
-                    self._wait_finished(child)
+            # Every child (images too) must be FINISHED before the parent can use it.
+            for child in children:
+                self._wait_finished(child)
             parent = self._post(
                 f"{self.ig_user_id}/media",
                 {"media_type": "CAROUSEL", "children": ",".join(children), **common},
@@ -278,13 +311,13 @@ class GraphBackend(Backend):
             self._wait_finished(parent)
             container = parent
         else:
-            if len(uploads) != 1:
+            if len(sources) != 1:
                 raise IgctlError(
                     f"A {req.media_type.value} takes exactly one file; use carousel for several."
                 )
-            src = uploads[0]
+            src, src_video = sources[0]
             params = dict(common)
-            video = is_video(src) or req.media_type in (MediaType.REEL, MediaType.VIDEO)
+            video = src_video or req.media_type in (MediaType.REEL, MediaType.VIDEO)
             if req.media_type is MediaType.STORY:
                 params.pop("caption", None)
                 params.pop("location_id", None)
@@ -293,15 +326,16 @@ class GraphBackend(Backend):
                 # Single-video feed posts are published as Reels (VIDEO is retired).
                 params["media_type"] = "REELS"
                 params["share_to_feed"] = str(req.share_to_feed).lower()
-                if req.cover:
-                    params["cover_url"] = upload_file(req.cover, self.config)
+                if cover_url:
+                    params["cover_url"] = cover_url
             elif req.media_type is not MediaType.IMAGE:
                 raise IgctlError(f"{src} does not look like a video for a {req.media_type.value}.")
             if req.media_type is not MediaType.STORY and (tags := self._user_tags(req, video)):
                 params["user_tags"] = tags
             container = self._create_container(src, params, video=video)
-            if video:
-                self._wait_finished(container)
+            # Image containers can still be IN_PROGRESS (slow fetch from the media host);
+            # publishing them then fails with "Media ID is not available".
+            self._wait_finished(container)
 
         media_id = self._post(f"{self.ig_user_id}/media_publish", {"creation_id": container})["id"]
         permalink: str | None = None
@@ -311,13 +345,49 @@ class GraphBackend(Backend):
             pass  # published fine; the permalink is a nicety
         return PublishResult(media_id=str(media_id), permalink=permalink, backend=self.name)
 
+    def _sources(self, req: PublishRequest, workdir: Path) -> list[tuple[str | Path, bool]]:
+        """``(url or local path, is_video)`` per item, uploading local files if needed.
+
+        Video-ness comes from the local file when there is one: hosted URLs (``cmd:`` hosts,
+        CDNs) often have no extension. Local images are converted to JPEG first, the only
+        image format the Graph API accepts.
+        """
+        if req.urls:
+            probe = req.media_type in (MediaType.CAROUSEL, MediaType.STORY)
+            return [(url, self._url_is_video(url, probe)) for url in req.urls]
+        if self._use_resumable(req):
+            return [(p, True) for p in req.paths]
+        kinds = [is_video(p) for p in req.paths]
+        hosted = [
+            upload_file(p if video else to_jpeg(p, workdir), self.config)
+            for p, video in zip(req.paths, kinds, strict=True)
+        ]
+        return list(zip(hosted, kinds, strict=True))
+
+    def _url_is_video(self, url: str, probe: bool) -> bool:
+        """Classify a public URL; rejects non-JPEG images, which the Graph API refuses."""
+        suffix = url_suffix(url)
+        if suffix in VIDEO_SUFFIXES:
+            return True
+        if suffix in IMAGE_SUFFIXES and suffix not in JPEG_SUFFIXES:
+            raise IgctlError(
+                f"{url}: the Graph API only accepts JPEG images, not '{suffix}'. Convert it, "
+                "or pass the local file so igctl converts and hosts it."
+            )
+        if suffix or not probe:
+            return False
+        # Extension-less URL in a carousel/story: ask the server what it is.
+        try:
+            resp = self._client.head(url, follow_redirects=True)
+        except httpx.HTTPError:
+            return False
+        ctype = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if ctype.startswith("image/") and ctype not in ("image/jpeg", "image/jpg"):
+            raise IgctlError(f"{url} is {ctype}; the Graph API only accepts JPEG images.")
+        return ctype.startswith("video/")
+
     def _use_resumable(self, req: PublishRequest) -> bool:
-        return (
-            self.is_facebook_host
-            and not self.config.media_host
-            and bool(req.paths)
-            and all(is_video(p) for p in req.paths)
-        )
+        return graph_direct_upload(req, self.account.graph_host, self.config)
 
     def _common_params(self, req: PublishRequest) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -414,7 +484,17 @@ class GraphBackend(Backend):
         profile.is_private = False
         return profile
 
+    def _require_facebook_host(self, feature: str) -> None:
+        if not self.is_facebook_host:
+            raise NotSupported(self.name, f"{feature} (needs a Facebook Login token)")
+
+    def supports(self, op: str) -> bool:
+        if op in ("delete_media", "hashtag_media") and not self.is_facebook_host:
+            return False
+        return super().supports(op)
+
     def _business_discovery(self, username: str, fields: str) -> dict[str, Any]:
+        self._require_facebook_host("business discovery")
         name = username.lstrip("@")
         body = self._get(
             self.ig_user_id, {"fields": f"business_discovery.username({name}){{{fields}}}"}
@@ -459,6 +539,7 @@ class GraphBackend(Backend):
         return out
 
     def hashtag_media(self, tag: str, limit: int = 50, recent: bool = False) -> list[Media]:
+        self._require_facebook_host("hashtag search")
         tag = tag.lstrip("#")
         found = self._get("ig_hashtag_search", {"user_id": self.ig_user_id, "q": tag})
         if not found.get("data"):
@@ -475,27 +556,42 @@ class GraphBackend(Backend):
     def account_insights(
         self, metrics: list[str], period: str = "day", days: int = 30
     ) -> list[Insight]:
+        """Account metrics over the last ``days``.
+
+        ``period`` is kept for interface compatibility and ignored: the Graph API takes
+        ``period=day`` for the interaction metrics and follower_count, and ``lifetime`` for
+        online_followers and demographics; the range comes from since/until windows.
+        """
         out: list[Insight] = []
         until = datetime.now(UTC).replace(microsecond=0)
         start = until - timedelta(days=max(days, 1))
-        series = [m for m in metrics if m in TIME_SERIES_METRICS]
+        lifetime = [m for m in metrics if m in LIFETIME_SERIES_METRICS]
+        series = [m for m in metrics if m in TIME_SERIES_METRICS and m not in lifetime]
         demographic = [m for m in metrics if m.endswith("_demographics")]
         totals = [m for m in metrics if m not in TIME_SERIES_METRICS and m not in demographic]
         path = f"{self.ig_user_id}/insights"
 
         for since, end in _windows(start, until):
             window = {"since": int(since.timestamp()), "until": int(end.timestamp())}
-            if series:
-                # follower_count/online_followers only cover the last 30 days.
-                if until - since <= MAX_INSIGHT_WINDOW:
-                    body = self._get(path, {"metric": ",".join(series), "period": period, **window})
-                    out.extend(_parse_insights(body))
+            # follower_count/online_followers only cover the last 30 days.
+            recent = until - since <= MAX_INSIGHT_WINDOW
+            # Separate requests: one invalid metric/period combination fails the whole call.
+            if series and recent:
+                body = self._get(
+                    path, {"metric": ",".join(series), "period": ACCOUNT_PERIOD, **window}
+                )
+                out.extend(_parse_insights(body))
+            if lifetime and recent:
+                body = self._get(
+                    path, {"metric": ",".join(lifetime), "period": "lifetime", **window}
+                )
+                out.extend(_parse_insights(body))
             if totals:
                 body = self._get(
                     path,
                     {
                         "metric": ",".join(totals),
-                        "period": period,
+                        "period": ACCOUNT_PERIOD,
                         "metric_type": "total_value",
                         **window,
                     },
@@ -519,11 +615,25 @@ class GraphBackend(Backend):
         return out
 
     def media_insights(self, media_id: str, metrics: list[str] | None = None) -> list[Insight]:
-        if not metrics:
-            kind = self.get_media(media_id).media_type
-            metrics = {MediaType.REEL: REEL_METRICS, MediaType.STORY: STORY_METRICS}.get(
+        if metrics:
+            return self._media_insights(media_id, metrics)
+        kind = self.get_media(media_id).media_type
+        if self.is_facebook_host:
+            defaults = {MediaType.REEL: REEL_METRICS, MediaType.STORY: STORY_METRICS}.get(
                 kind, FEED_METRICS
             )
+            return self._media_insights(media_id, defaults)
+        # Instagram-Login host: media_product_type isn't available, so a story looks like an
+        # IMAGE/VIDEO and a reel like a VIDEO. Try the likely set, then the always-valid one.
+        guess = REEL_METRICS if kind is MediaType.VIDEO else FEED_METRICS
+        try:
+            return self._media_insights(media_id, guess)
+        except (AuthError, RateLimited, TransientError):
+            raise
+        except IgctlError:
+            return self._media_insights(media_id, COMMON_METRICS)
+
+    def _media_insights(self, media_id: str, metrics: list[str]) -> list[Insight]:
         body = self._get(f"{media_id}/insights", {"metric": ",".join(metrics)})
         return _parse_insights(body)
 

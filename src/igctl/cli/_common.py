@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from igctl.core.context import Context
 
@@ -47,43 +48,53 @@ def emit(
 
     ``data`` may be a model, dict, or a list of either. ``columns`` picks and orders the
     fields shown in table mode (JSON mode always prints everything).
+
+    Values and ``title`` are shown literally: captions, comments, DMs and usernames are
+    user data and must never be parsed as Rich markup (``[/]`` would crash the command).
     """
     plain = _plain(data)
     if ctx.json_output:
         console.print_json(json.dumps(plain, default=str))
         return
+    safe_title = escape(title) if title else None
     if isinstance(plain, list):
         rows: Iterable[dict] = plain
         cols = list(columns or (plain[0].keys() if plain else []))
-        table = Table(title=title, show_lines=False)
+        table = Table(title=safe_title, show_lines=False)
         for c in cols:
-            table.add_column(c)
+            table.add_column(escape(str(c)))
         for r in rows:
             table.add_row(*(_cell(r.get(c)) for c in cols))
         console.print(table)
         return
     if isinstance(plain, dict):
-        table = Table(title=title, show_header=False, box=None)
+        table = Table(title=safe_title, show_header=False, box=None)
         table.add_column(style="bold cyan")
         table.add_column()
         for k in columns or plain.keys():
-            table.add_row(k, _cell(plain.get(k)))
+            table.add_row(Text(str(k)), _cell(plain.get(k)))
         console.print(table)
         return
-    console.print(plain)
+    console.print(plain, markup=False)
 
 
-def _cell(v: Any) -> str:
+def emit_ok(ctx: Context, **fields: Any) -> None:
+    """In ``--json`` mode, print ``{"ok": true, ...}`` for commands with no other output."""
+    if ctx.json_output:
+        emit(ctx, {"ok": True, **fields})
+
+
+def _cell(v: Any) -> Text:
     if v is None:
-        return "-"
+        return Text("-")
     if isinstance(v, float):
-        return f"{v:,.2f}"
+        return Text(f"{v:,.2f}")
     if isinstance(v, int):
-        return f"{v:,}"
+        return Text(f"{v:,}")
     if isinstance(v, dict | list):
-        return json.dumps(v, default=str)
+        return Text(json.dumps(v, default=str))
     s = str(v)
-    return s if len(s) <= 80 else s[:77] + "..."
+    return Text(s if len(s) <= 80 else s[:77] + "...")
 
 
 def ok(msg: str) -> None:
@@ -95,7 +106,8 @@ def warn(msg: str) -> None:
 
 
 def confirm_or_abort(ctx: Context, prompt: str, yes: bool) -> None:
+    """Ask for confirmation on stderr (stdout carries --json output) unless ``--yes``."""
     if yes or ctx.dry_run:
         return
-    if not typer.confirm(prompt):
+    if not typer.confirm(prompt, err=True):
         raise typer.Abort()

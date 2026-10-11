@@ -59,9 +59,11 @@ def run(
         results = engine.run_once(rule, force=force)
         if not results:
             ok("Nothing due. Use --force to run anyway, or `automate status` to see schedules.")
+            if c.json_output:
+                emit(c, [])
             return
         _show(c, results)
-        if any(r.status == "error" for r in results):
+        if any(r.status in ("error", "blocked") for r in results):
             raise typer.Exit(1)
         return
     if force:

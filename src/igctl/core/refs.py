@@ -85,8 +85,12 @@ def resolve_media(backend: Backend, ref: str) -> str:
 
 
 def normalize_username(ref: str) -> str:
-    """Accept ``name``, ``@name`` or ``instagram.com/name/``."""
+    """Accept ``name``, ``@name`` or ``instagram.com/name/``; returns the lower-case handle.
+
+    Instagram handles are case-insensitive (and stored lower-case), so normalising here keeps
+    the action log, dedup keys and follow history consistent with what backends return.
+    """
     ref = ref.strip()
     if is_url(ref):
         ref = urlparse(ref if "://" in ref else "https://" + ref).path.strip("/").split("/")[0]
-    return ref.lstrip("@")
+    return ref.lstrip("@").lower()

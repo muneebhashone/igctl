@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import string
+from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
 from igctl.backends.base import Backend
-from igctl.cli._common import confirm_or_abort, emit, get_ctx, ok, warn
-from igctl.cli.engage import normalize_username, read_lines, report_bulk, run_bulk
+from igctl.cli._common import confirm_or_abort, emit, emit_ok, get_ctx, ok, warn
+from igctl.cli.engage import BulkResult, normalize_username, read_lines, report_bulk, run_bulk
+from igctl.core.files import read_text_file
 from igctl.core.models import DirectThread
+from igctl.core.ratelimit import requires
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -34,7 +38,7 @@ def _thread_row(t: DirectThread) -> dict[str, Any]:
 def inbox(
     ctx: typer.Context,
     unread: Annotated[bool, typer.Option("--unread", help="Only unread threads.")] = False,
-    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    limit: Annotated[int, typer.Option("--limit", "-n", min=0, help="Max threads (0 = all).")] = 20,
 ) -> None:
     """List direct-message threads."""
     c = get_ctx(ctx)
@@ -52,7 +56,9 @@ def inbox(
 def read(
     ctx: typer.Context,
     thread: Annotated[str, typer.Argument(help="Thread id.")],
-    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=0, help="Max messages (0 = all).")
+    ] = 20,
 ) -> None:
     """Show the latest messages of a thread."""
     c = get_ctx(ctx)
@@ -76,14 +82,14 @@ def send(
     """Send a direct message to one or more users."""
     if (text is None) == (file is None):
         raise typer.BadParameter("pass exactly one of --text or --file")
-    body = file.read_text(encoding="utf-8").strip() if file is not None else (text or "")
+    body = read_text_file(file, "message file").strip() if file is not None else (text or "")
     if not body:
         raise typer.BadParameter("message is empty")
     c = get_ctx(ctx)
     b = c.backend()
     names = [normalize_username(u) for u in users]
     batches = [names] if group else [[n] for n in names]
-    items = [(",".join(r), (lambda r=r: b.send_dm(r, body))) for r in batches]
+    items = [(",".join(r), partial(b.send_dm, r, body)) for r in batches]
     res = run_bulk(c, "dm", items, progress=len(items) > 1)
     for err in res.errors:
         warn(f"{err['target']}: {err['error']}")
@@ -106,9 +112,10 @@ def reply(
     """Reply in an existing thread."""
     c = get_ctx(ctx)
     b = c.backend()
-    result = c.guard.act("dm", thread, lambda: b.reply_dm(thread, text))
+    result = c.guard.act("dm", thread, partial(b.reply_dm, thread, text))
     if c.dry_run:
         warn(f"[dry-run] would reply in thread {thread}")
+        emit_ok(c, action="dm", target=thread, dry_run=True)
         return
     ok(f"replied in thread {thread}")
     if c.json_output and result is not None:
@@ -166,11 +173,16 @@ def broadcast(
     pending = pending[:max_actions]
     if not pending:
         ok(f"Nothing to send ({skipped} already messaged with this template).")
+        if c.json_output:
+            emit(c, asdict(BulkResult(action="dm", total=0, skipped=skipped, dry_run=c.dry_run)))
         return
     if not c.json_output:
         ok(f"Preview: {template.format_map({f: f'<{f}>' for f in fields})}")
     confirm_or_abort(c, f"Send DM to {len(pending)} user(s)?", yes)
-    items = [(u, (lambda u=u: b.send_dm([u], render(template, b, u, fields)))) for u in pending]
+    items = [
+        (u, requires(b, "send_dm", lambda u=u: b.send_dm([u], render(template, b, u, fields))))
+        for u in pending
+    ]
     res = run_bulk(
         c,
         "dm",

@@ -277,7 +277,7 @@ def test_bulk_like_stops_at_daily_cap(env) -> None:
     run, b, state, _ = env
     state["json"] = True
     r = run("engage", "bulk-like", "--hashtag", "cats", "--max", "5")
-    assert r.exit_code == 0, r.output
+    assert r.exit_code == 1, r.output  # stopped early: not a clean success
     summary = json.loads(r.stdout)
     assert summary["done"] == 3 and summary["stopped"]
     assert len(b.calls) == 3
@@ -397,3 +397,96 @@ def test_broadcast_rejects_unknown_placeholder(env) -> None:
     f.write_text("alice\n", encoding="utf-8")
     r = run("dm", "broadcast", "-f", str(f), "-t", "Hi {nickname}", "-y")
     assert r.exit_code != 0
+
+
+# --- regressions -------------------------------------------------------------------
+
+
+def test_dry_run_reports_unsupported_backend_action(tmp_path: Path, monkeypatch) -> None:
+    from functools import partial
+
+    from igctl.backends.base import NotSupported
+    from igctl.backends.graph import GraphBackend
+    from igctl.core.ratelimit import requires
+    from igctl.core.storage import Store
+
+    monkeypatch.setenv("IGCTL_HOME", str(tmp_path))
+    graph = GraphBackend(Account(name="g", ig_user_id="1"))
+    guard = Guard("g", Limits(), Store(tmp_path / "x.db"), dry_run=True)
+    with pytest.raises(NotSupported, match="like"):
+        guard.act("like", "1", partial(graph.like, "1"))
+    with pytest.raises(NotSupported, match="send_dm"):
+        guard.act("dm", "bob", requires(graph, "send_dm", lambda: graph.send_dm(["bob"], "x")))
+    assert guard.act("comment", "1", partial(graph.comment, "1", "hi")) is None  # supported
+
+
+def test_dry_run_counts_toward_daily_cap(env) -> None:
+    run, b, state, _ = env
+    state["dry_run"], state["json"] = True, True
+    r = run("engage", "bulk-like", "--hashtag", "cats", "--max", "5")  # cap: 3 likes/24h
+    summary = json.loads(r.stdout)
+    assert summary["done"] == 3 and summary["stopped"]  # what a real run would do
+    assert b.calls == []
+
+
+def test_read_lines_handles_windows_encodings(tmp_path: Path) -> None:
+    from igctl.backends.base import IgctlError
+    from igctl.cli.engage import read_lines
+
+    bom = tmp_path / "bom.txt"
+    bom.write_bytes("﻿Alice\nbob\n".encode())
+    assert read_lines(bom) == ["alice", "bob"]  # BOM stripped, handles lower-cased
+    utf16 = tmp_path / "u16.txt"
+    utf16.write_text("carol\r\ndave\r\n", encoding="utf-16")
+    assert read_lines(utf16) == ["carol", "dave"]
+    cp = tmp_path / "cp.txt"
+    cp.write_bytes("caf\xe9\n".encode("cp1252"))
+    with pytest.raises(IgctlError, match="not UTF-8"):
+        read_lines(cp)
+    with pytest.raises(IgctlError, match="Can't read"):
+        read_lines(tmp_path / "missing.txt")
+
+
+def test_bulk_failures_exit_nonzero(env) -> None:
+    run, b, state, tmp = env
+    users = tmp / "users.txt"
+    users.write_text("ok1\nbad\n", encoding="utf-8")
+
+    def follow(username: str) -> None:
+        if username == "bad":
+            raise RuntimeError("nope")
+
+    b.follow = follow  # type: ignore[method-assign]
+    r = run("engage", "bulk-follow", "-f", str(users))
+    assert r.exit_code == 1
+
+
+def test_json_mode_always_prints_json(env) -> None:
+    run, b, state, tmp = env
+    state["json"] = True
+    r = run("engage", "purge-comments", "m1", "--match", "zzz-no-match", "-y")
+    assert json.loads(r.stdout)["total"] == 0
+    r = run("engage", "hide-comment", "c1")
+    assert json.loads(r.stdout)["ok"] is True
+
+
+def test_closed_pipe_exits_quietly(monkeypatch) -> None:
+    import errno
+
+    from igctl.cli import main
+
+    def broken() -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(main, "app", broken)
+    monkeypatch.setattr(main, "_silence_stdout", lambda: None)
+    with pytest.raises(SystemExit) as info:
+        main.run()
+    assert info.value.code == 1
+
+    def other() -> None:
+        raise OSError(errno.ENOENT, "missing")
+
+    monkeypatch.setattr(main, "app", other)
+    with pytest.raises(OSError):
+        main.run()

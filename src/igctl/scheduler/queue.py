@@ -12,7 +12,7 @@ import csv
 import io
 import json
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
@@ -22,6 +22,7 @@ import yaml
 from pydantic import BaseModel, ValidationError
 
 from igctl.backends.base import IgctlError
+from igctl.core.files import read_text_file
 from igctl.core.models import MediaType, PublishRequest
 from igctl.core.storage import Store, iso, utcnow
 from igctl.core.validation import (
@@ -257,10 +258,12 @@ def recover_stale(
     """
     _ensure_claims(store)
     cutoff = iso((now or utcnow()) - older_than)
+    # Claims are written atomically with the status change (Store.claim_post), so a running
+    # post without one predates that and is stale by definition.
     rows = store._conn.execute(
         "SELECT p.id, p.attempts FROM scheduled_posts p "
         "LEFT JOIN scheduler_claims c ON c.post_id = p.id "
-        "WHERE p.status='running' AND COALESCE(c.claimed_at, p.run_at) < ?",
+        "WHERE p.status='running' AND (c.claimed_at IS NULL OR c.claimed_at < ?)",
         (cutoff,),
     ).fetchall()
     note = "Recovered from a stale 'running' state (runner interrupted); check for a duplicate."
@@ -329,7 +332,7 @@ def read_calendar(path: Path) -> list[dict[str, Any]]:
     """Raw rows from a CSV (header row) or YAML (list, or ``{posts: [...]}``) calendar."""
     if not path.is_file():
         raise ScheduleError(f"Calendar file not found: {path}")
-    text = path.read_text(encoding="utf-8-sig")
+    text = read_text_file(path, "calendar")
     suffix = path.suffix.lower()
     if suffix == ".csv":
         reader = csv.DictReader(io.StringIO(text))
@@ -359,8 +362,13 @@ def parse_calendar(
     tz: str | tzinfo | None = None,
     known_accounts: Iterable[str] | None = None,
     now: datetime | None = None,
+    check: Callable[[str, PublishRequest], None] | None = None,
 ) -> list[CalendarEntry]:
-    """Validate every row; raise :class:`CalendarError` listing all problems, or return entries."""
+    """Validate every row; raise :class:`CalendarError` listing all problems, or return entries.
+
+    ``check(account, request)`` adds caller-specific validation (e.g. that the account's
+    backend can publish the row's files); an :class:`IgctlError` from it is a row error.
+    """
     known = set(known_accounts) if known_accounts is not None else None
     entries: list[CalendarEntry] = []
     errors: list[str] = []
@@ -388,11 +396,13 @@ def parse_calendar(
                 cover=row.cover,
                 location=row.location,
             )
+            if check is not None:
+                check(account, req)
             entries.append(CalendarEntry(row=i, account=account, run_at=run_at, request=req))
         except ValidationError as e:
             missing = [".".join(map(str, err["loc"])) for err in e.errors()]
             errors.append(f"{label}: missing/invalid field(s): {', '.join(missing)}")
-        except (ScheduleError, TimeParseError) as e:
+        except (ScheduleError, TimeParseError, IgctlError) as e:
             errors.append(f"{label}: {e}")
     if errors:
         raise CalendarError(errors)
@@ -424,6 +434,7 @@ def import_calendar(
     tz: str | tzinfo | None = None,
     known_accounts: Iterable[str] | None = None,
     dry_run: bool = False,
+    check: Callable[[str, PublishRequest], None] | None = None,
 ) -> list[tuple[int | None, CalendarEntry]]:
     """Validate a calendar file and enqueue every row. Relative files resolve next to it."""
     rows = read_calendar(path)
@@ -433,6 +444,7 @@ def import_calendar(
         base_dir=path.resolve().parent,
         tz=tz,
         known_accounts=known_accounts,
+        check=check,
     )
     if dry_run:
         return [(None, e) for e in entries]

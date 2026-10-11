@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import sys
 
 import typer
@@ -69,10 +71,32 @@ def _utf8_streams() -> None:
                 pass
 
 
+def _closed_pipe(exc: BaseException) -> bool:
+    # On Windows a reader that went away (`| head`, `| Select-Object -First`) surfaces as
+    # EINVAL rather than EPIPE/BrokenPipeError.
+    return isinstance(exc, BrokenPipeError) or (
+        isinstance(exc, OSError) and exc.errno in (errno.EPIPE, errno.EINVAL)
+    )
+
+
+def _silence_stdout() -> None:
+    # Point stdout at devnull so the interpreter's final flush doesn't fail again.
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def run() -> None:
     _utf8_streams()
     try:
         app()
+    except OSError as e:
+        if not _closed_pipe(e):
+            raise
+        _silence_stdout()
+        sys.exit(1)
     except NotSupported as e:
         other = "private" if e.backend == "graph" else "graph"
         err_console.print(f"[red]error:[/red] {escape(str(e))}")

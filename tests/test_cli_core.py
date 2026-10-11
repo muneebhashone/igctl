@@ -95,12 +95,12 @@ def account(env):
     return env
 
 
-def make_app(dry_run: bool = False) -> typer.Typer:
+def make_app(dry_run: bool = False, backend: str | None = None) -> typer.Typer:
     root = typer.Typer()
 
     @root.callback()
     def cb(ctx: typer.Context, json_output: bool = typer.Option(False, "--json")) -> None:
-        ctx.obj = Context(dry_run=dry_run, json_output=json_output)
+        ctx.obj = Context(dry_run=dry_run, json_output=json_output, backend_override=backend)
 
     root.add_typer(auth.app, name="auth")
     root.add_typer(post.app, name="post")
@@ -108,8 +108,8 @@ def make_app(dry_run: bool = False) -> typer.Typer:
     return root
 
 
-def invoke(*args: str, dry_run: bool = False, input: str | None = None):
-    return runner.invoke(make_app(dry_run), list(args), input=input)
+def invoke(*args: str, dry_run: bool = False, input: str | None = None, backend: str | None = None):
+    return runner.invoke(make_app(dry_run, backend), list(args), input=input)
 
 
 def img(path: Path, size: tuple[int, int]) -> Path:
@@ -141,6 +141,17 @@ def test_login_graph_failure_rolls_back_token(env, monkeypatch):
     assert isinstance(r.exception, AuthError)
     assert get_secret("brand", "token") == "OLD"
     assert "brand" not in Config.load().accounts
+
+
+def test_login_honours_global_backend(env, monkeypatch):
+    be = FakeBackend("private")
+    made: list[str] = []
+    monkeypatch.setattr(auth, "make_backend", lambda n, a: made.append(n) or be)
+    r = invoke("auth", "login", "p2", "-u", "brand", "--password", "pw", backend="private")
+    assert r.exit_code == 0, r.output
+    assert made == ["private"] and Config.load().accounts["p2"].backend == "private"
+    r = invoke("auth", "login", "p3", "--backend", "graph", "--token", "T", backend="private")
+    assert r.exit_code != 0  # conflicting global and local --backend
 
 
 def test_login_private_prompts_password(env, monkeypatch):
@@ -285,14 +296,18 @@ def test_validate_sources(tmp_path):
         post.validate_request(PublishRequest(media_type=MediaType.VIDEO, urls=["https://x/a.jpg"]))
 
 
-def test_parse_at():
-    now = datetime(2026, 1, 1, tzinfo=UTC)
-    assert post.parse_at("2026-01-02T10:00Z", now) == datetime(2026, 1, 2, 10, tzinfo=UTC)
-    assert post.parse_at("2026-01-02T12:00+02:00", now).hour == 10
-    with pytest.raises(IgctlError, match="past"):
-        post.parse_at("2025-01-01T00:00Z", now)
-    with pytest.raises(IgctlError, match="Invalid"):
-        post.parse_at("tomorrow", now)
+def test_post_at_matches_schedule_add(account, tmp_path):
+    # `post --at` and `schedule add` share validation, past-time handling and JSON shape.
+    p = img(tmp_path / "a.jpg", (1080, 1080))
+    r = invoke("--json", "post", "photo", str(p), "--at", "2020-01-01T00:00Z", "-c", "x")
+    assert r.exit_code == 0, r.output
+    assert "in the past" in r.stderr  # warned and queued, like `schedule add`
+    row = json.loads(r.stdout)
+    assert row["status"] == "pending" and row["account"] == "main"
+    assert row["run_at"] == "2020-01-01T00:00:00+00:00"
+    assert row["request"]["caption"] == "x"
+    r = invoke("post", "photo", str(p), "--at", "tomorrow")
+    assert isinstance(r.exception, IgctlError)
 
 
 # --- post commands ---------------------------------------------------------------
@@ -348,6 +363,16 @@ def test_post_carousel_urls(account):
     assert account.published[0].urls == ["https://x/a.jpg", "https://x/b.mp4"]
 
 
+def test_post_graph_schedule_local_file_needs_media_host(account, tmp_path):
+    cfg = Config.load()
+    cfg.accounts["main"].backend = "graph"
+    cfg.save()
+    p = img(tmp_path / "a.jpg", (1080, 1080))
+    r = invoke("post", "photo", str(p), "--at", "+1h")
+    assert isinstance(r.exception, IgctlError) and "media_host" in str(r.exception)
+    assert Store().list_posts() == []
+
+
 def test_post_graph_local_file_needs_url(account, tmp_path):
     account.name = "graph"
     p = img(tmp_path / "a.jpg", (1080, 1080))
@@ -366,6 +391,34 @@ def test_post_schedule_enqueues(account, tmp_path):
     assert datetime.fromisoformat(row["run_at"]) == when
     req = PublishRequest.model_validate_json(row["request"])
     assert req.caption == "later" and req.paths == [p.resolve()]
+
+
+def test_json_output_is_clean_for_write_commands(account):
+    # The confirmation prompt goes to stderr, and write-only commands still print JSON.
+    r = invoke("--json", "post", "delete", "123", input="y\n")
+    assert r.exit_code == 0, r.output
+    assert "Delete media" not in r.stdout
+    # (CliRunner echoes the typed answer to stdout; a real terminal echoes it to the tty.)
+    assert json.loads(r.stdout[r.stdout.index("{") :]) == {
+        "ok": True,
+        "media_id": "123",
+        "action": "delete",
+        "dry_run": False,
+    }
+    assert "Delete media" in r.stderr
+    r = invoke("--json", "post", "edit", "123", "-c", "new")
+    assert json.loads(r.stdout)["ok"] is True
+
+
+def test_emit_never_parses_user_data_as_markup(capsys):
+    from igctl.cli._common import emit
+
+    ctx = Context()
+    emit(ctx, [{"caption": "sale [/] ends", "user": "[bold]x[/bold]"}], title="Users: [/]")
+    emit(ctx, {"caption": "[red]x"}, title="@[/]")
+    emit(ctx, "plain [/] text")
+    out = capsys.readouterr().out
+    assert "sale [/] ends" in out and "[bold]x[/bold]" in out and "[red]x" in out
 
 
 def test_post_delete_edit_list(account):
@@ -412,7 +465,7 @@ def test_download_post_and_profile(account, tmp_path):
 
     account.downloaded.clear()
     r = invoke("--json", "download", "profile", "@nasa", "--limit", "3")
-    assert r.exit_code == 0, r.output
+    assert r.exit_code == 1, r.output  # a failed post must be visible to cron wrappers
     data = json.loads(r.stdout)
     assert data["failed"] == 1 and len(data["files"]) == 2
     assert Path(data["dest"]) == Path("nasa")

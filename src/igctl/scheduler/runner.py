@@ -12,7 +12,15 @@ from functools import partial
 from types import FrameType
 from typing import Literal, Protocol
 
-from igctl.backends.base import AuthError, Backend, IgctlError, NotSupported, RateLimited
+from igctl.backends.base import (
+    ActionBlocked,
+    AuthError,
+    Backend,
+    IgctlError,
+    NotSupported,
+    RateLimited,
+    TransientError,
+)
 from igctl.core.models import PublishRequest, PublishResult
 from igctl.core.ratelimit import Guard
 from igctl.core.storage import Store, utcnow
@@ -23,8 +31,9 @@ BACKOFF_BASE = timedelta(minutes=5)
 STALE_AFTER = timedelta(hours=1)
 CAP_WAIT = timedelta(hours=1)
 
-# Exceptions (by class name, anywhere in the MRO) worth retrying. Names keep instagrapi/httpx
-# optional here: the backends usually map them to RateLimited, but not always.
+# Exceptions (by class name, anywhere in the MRO) worth retrying. The backends map these to
+# RateLimited/TransientError; the names also match an original exception kept as __cause__.
+# Action blocks (FeedbackRequired, SentryBlock) are deliberately absent: see ActionBlocked.
 _TRANSIENT_NAMES = frozenset(
     {
         "TransportError",  # httpx network errors
@@ -35,7 +44,6 @@ _TRANSIENT_NAMES = frozenset(
         "ClientThrottledError",
         "PleaseWaitFewMinutes",
         "RateLimitError",
-        "SentryBlock",
     }
 )
 
@@ -66,11 +74,22 @@ class RunOutcome:
 
 
 def is_transient(exc: BaseException) -> bool:
-    if isinstance(exc, RateLimited | ConnectionError | TimeoutError):
-        return True
-    if isinstance(exc, NotSupported | AuthError):
-        return False
-    return any(cls.__name__ in _TRANSIENT_NAMES for cls in type(exc).__mro__)
+    """Whether a failed publish is worth retrying after a backoff.
+
+    Follows the ``__cause__`` chain, since backends wrap transport errors in igctl errors.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, NotSupported | AuthError | ActionBlocked):
+            return False
+        if isinstance(current, RateLimited | TransientError | ConnectionError | TimeoutError):
+            return True
+        if any(cls.__name__ in _TRANSIENT_NAMES for cls in type(current).__mro__):
+            return True
+        current = current.__cause__
+    return False
 
 
 def backoff_delay(attempt: int, base: timedelta = BACKOFF_BASE) -> timedelta:
@@ -122,10 +141,9 @@ def run_due(
         if dry_run:
             report(RunOutcome(post_id, account, "dry-run", "would publish"))
             continue
-        if not store.claim_post(post_id):
+        if not store.claim_post(post_id, now):
             report(RunOutcome(post_id, account, "skipped", "claimed by another runner"))
             continue
-        queue.record_claim(store, post_id)
         attempts = int(row["attempts"]) + 1
         try:
             req = PublishRequest.model_validate_json(row["request"])
