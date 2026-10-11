@@ -6,9 +6,10 @@ import sys
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from igctl import __version__
-from igctl.backends.base import IgctlError
+from igctl.backends.base import IgctlError, NotSupported
 from igctl.cli import analyze, auth, automate, dm, download, engage, post, schedule
 from igctl.core.context import Context
 
@@ -45,7 +46,9 @@ def main(
     backend: str | None = typer.Option(
         None, "--backend", "-b", help="Force a backend: graph | private."
     ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would happen; change nothing."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would happen; change nothing."
+    ),
     json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
 ) -> None:
@@ -56,11 +59,27 @@ def main(
     )
 
 
+def _utf8_streams() -> None:
+    # Legacy Windows code pages can't encode the symbols rich prints (e.g. check marks).
+    for stream in (sys.stdout, sys.stderr):
+        if (getattr(stream, "encoding", "") or "").lower() not in ("utf-8", "utf8"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            except (AttributeError, ValueError):
+                pass
+
+
 def run() -> None:
+    _utf8_streams()
     try:
         app()
+    except NotSupported as e:
+        other = "private" if e.backend == "graph" else "graph"
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
+        err_console.print(f"[dim]hint: retry with `igctl --backend {other} ...`[/dim]")
+        sys.exit(1)
     except IgctlError as e:
-        err_console.print(f"[red]error:[/red] {e}")
+        err_console.print(f"[red]error:[/red] {escape(str(e))}")
         sys.exit(1)
 
 

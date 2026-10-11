@@ -9,6 +9,7 @@ from typing import Any
 import typer
 from pydantic import BaseModel
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from igctl.core.context import Context
@@ -86,11 +87,11 @@ def _cell(v: Any) -> str:
 
 
 def ok(msg: str) -> None:
-    err_console.print(f"[green]✓[/green] {msg}")
+    err_console.print(f"[green]✓[/green] {escape(msg)}")
 
 
 def warn(msg: str) -> None:
-    err_console.print(f"[yellow]![/yellow] {msg}")
+    err_console.print(f"[yellow]![/yellow] {escape(msg)}")
 
 
 def confirm_or_abort(ctx: Context, prompt: str, yes: bool) -> None:
