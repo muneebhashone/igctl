@@ -1,8 +1,24 @@
 [project]
 name = "igctl"
 version = "0.1.0"
-description = "Command-line toolkit to publish, analyze and automate Instagram"
+description = "Command-line toolkit to publish, schedule, analyze and automate Instagram"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["instagram", "cli", "automation", "instagram-api", "graph-api", "instagrapi", "social-media", "scheduler", "analytics", "agent-skills"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet",
+    "Topic :: Utilities",
+]
 authors = [
     { name = "muneebhashone", email = "themuneebh@gmail.com" }
 ]
@@ -20,6 +36,11 @@ dependencies = [
     "tzdata>=2026.5 ; sys_platform == 'win32'",
     "moviepy>=2.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/muneebhashone/igctl"
+Repository = "https://github.com/muneebhashone/igctl"
+Issues = "https://github.com/muneebhashone/igctl/issues"
 
 [project.scripts]
 igctl = "igctl.cli.main:run"

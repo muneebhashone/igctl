@@ -1,5 +1,9 @@
 # igctl
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![Agent Skill](https://img.shields.io/badge/agent%20skill-included-8A2BE2.svg)](skills/igctl/SKILL.md)
+
 `igctl` is a command-line toolkit to **publish, schedule, analyze and automate Instagram**:
 
 - **Publishing:** photos, videos, reels (with cover and feed toggle), carousels and stories, now or at a set time.
@@ -52,11 +56,12 @@ Instagram's real thresholds are not published, change over time and are lower fo
 You need Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <this repo> igctl && cd igctl
-uv tool install .            # puts `igctl` on your PATH
-uv tool install '.[s3]'      # ...with S3 support for media_host
+uv tool install git+https://github.com/muneebhashone/igctl          # puts `igctl` on your PATH
+uv tool install "igctl[s3] @ git+https://github.com/muneebhashone/igctl"   # ...with S3 support for media_host
 igctl --help
 ```
+
+Or from a clone: `git clone https://github.com/muneebhashone/igctl && cd igctl && uv tool install .`
 
 To develop: `uv sync`, then `uv run igctl ...`, `uv run pytest`, and `uv run ruff check .`.
 
@@ -472,6 +477,23 @@ The code is laid out as follows:
 - `src/igctl/analytics/` is metrics, reports, follower diffs and export.
 - `src/igctl/automation/` is rules, the trigger registry, handlers, the engine and state.
 - `src/igctl/cli/` holds one Typer module per command group.
+
+## Contributing
+
+Issues and pull requests are welcome. Before you open a PR:
+
+```bash
+uv sync
+uv run pytest -q
+uv run ruff check . && uv run ruff format --check .
+uv run python scripts/gen_skill_reference.py   # if you changed any command or option
+```
+
+Tests run offline. Never add tests that hit Instagram or need real credentials. See [AGENTS.md](AGENTS.md) for the architecture and conventions, which apply to human contributors as well.
+
+## License
+
+[MIT](LICENSE) © muneebhashone
 
 ## Disclaimer
 
